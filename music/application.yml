@@ -1,0 +1,115 @@
+# Lavalink config for the shared Oversite music node.
+#
+# Sources enabled: SoundCloud (native, no credentials, primary), direct HTTP
+# streams (for SomaFM radio), plus Spotify/Apple Music LINK resolution via the
+# LavaSrc plugin — which mirrors those links to SoundCloud audio. YouTube is
+# deliberately OFF (its datacenter-IP bot-check is the maintenance treadmill we're
+# escaping), and Deezer is OFF (its stream decryption is a ToS/DMCA risk for a
+# commercial product). SoundCloud alone needs zero upkeep.
+#
+# Everything sensitive comes from env vars so nothing secret lives in git:
+#   LAVALINK_SERVER_PASSWORD  - shared password every bot uses to connect
+#   PORT                      - injected by Railway; Lavalink binds it
+#   SPOTIFY_CLIENT_ID/SECRET  - optional; only needed if the anonymous Spotify
+#                               path stops working (SoundCloud is unaffected)
+
+server:
+  port: ${PORT:2333}
+  address: 0.0.0.0
+
+lavalink:
+  plugins:
+    - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.8.3"
+      repository: "https://maven.lavalink.dev/releases"
+      snapshot: false
+    # youtube-source ships installed but DISABLED (plugins.youtube.enabled below).
+    # As of Aug 2026 YouTube from datacenter IPs is "fixable but fragile" even on
+    # the newest plugin (open issue #226) — enable only as an experiment via
+    # YOUTUBE_ENABLED=true, ideally with a burner-account OAuth token.
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.2"
+      repository: "https://maven.lavalink.dev/releases"
+      snapshot: false
+  server:
+    password: ${LAVALINK_SERVER_PASSWORD:changeme}
+    sources:
+      youtube: false      # OFF on purpose — no YouTube bot-check treadmill
+      soundcloud: true     # primary source, native, no credentials
+      bandcamp: true
+      twitch: true
+      vimeo: true
+      http: true           # SomaFM radio streams play through this
+      local: false
+    filters:
+      volume: true
+      equalizer: true
+      karaoke: true
+      timescale: true
+    bufferDurationMs: 400
+    frameBufferDurationMs: 5000
+    opusEncodingQuality: 10
+    resamplingQuality: LOW
+    trackStuckThresholdMs: 10000
+    useSeekGhosting: true
+    playerUpdateInterval: 5
+    youtubeSearchEnabled: false
+    soundcloudSearchEnabled: true
+
+plugins:
+  # Optional YouTube (OFF by default). The researched Aug-2026 recipe: modern
+  # client list (ANDROID_VR/MUSIC lead; no bare TVHTML5 — that's the client with
+  # the open "page needs to be reloaded" bot-check), burner-account OAuth, and
+  # remote cipher so YouTube's cipher churn can't break us between releases.
+  youtube:
+    enabled: ${YOUTUBE_ENABLED:false}
+    clients:
+      - MUSIC
+      - ANDROID_VR
+      - TV
+      - TVHTML5_SIMPLY
+      - WEB
+      - WEBEMBEDDED
+    oauth:
+      enabled: ${YOUTUBE_OAUTH_ENABLED:false}
+      refreshToken: "${YOUTUBE_OAUTH_REFRESH_TOKEN:}"
+    remoteCipher:
+      url: "${YOUTUBE_REMOTE_CIPHER_URL:https://cipher.kikkia.dev}"
+  lavasrc:
+    sources:
+      spotify: true        # resolve Spotify links/search (metadata only)
+      applemusic: true     # resolve Apple Music links (metadata only)
+      # Deezer streams real audio and — unlike YouTube/SoundCloud — is not
+      # IP-reputation-blocked from datacenter hosts (auth is a login cookie).
+      # OFF until you supply credentials via env (see README): its stream
+      # decryption is a ToS gray area, so enabling it is a business decision.
+      deezer: ${DEEZER_ENABLED:false}
+      yandexmusic: false
+      youtube: false        # OFF — never mirror to YouTube
+      soundcloud: false     # SoundCloud is handled by Lavalink core above
+    deezer:
+      arl: "${DEEZER_ARL:}"                        # deezer.com 'arl' cookie (burner account)
+      masterDecryptionKey: "${DEEZER_MASTER_KEY:}" # not distributed here — see README
+      formats: [ "MP3_128" ]                       # free-account tier; plenty for Discord voice
+    # Where a Spotify/Apple track's audio actually comes from, in order:
+    # Deezer by exact ISRC, then Deezer text search, then SoundCloud text search.
+    # With Deezer disabled the dz providers yield nothing and it falls through
+    # to SoundCloud automatically. No YouTube anywhere.
+    providers:
+      - "dzisrc:%ISRC%"
+      - "dzsearch:%QUERY%"
+      - "scsearch:%QUERY%"
+    spotify:
+      preferPartnerApi: true    # anonymous token path — no app clientId/secret needed
+      clientId: "${SPOTIFY_CLIENT_ID:}"
+      clientSecret: "${SPOTIFY_CLIENT_SECRET:}"
+      countryCode: "US"
+      playlistLoadLimit: 6
+      albumLoadLimit: 6
+    applemusic:
+      countryCode: "US"
+      playlistLoadLimit: 6
+      albumLoadLimit: 6
+
+logging:
+  level:
+    root: INFO
+    lavalink: INFO
