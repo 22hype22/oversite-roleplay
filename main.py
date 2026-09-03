@@ -31,7 +31,8 @@ DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://oversite.shop/bot-dashboard"
 
 # Which product this deployment is. The same code runs every Roblox-side base;
 # the base picks the brand name, which slash commands exist, and which
-# dashboard blocks are loaded. "customs" = Oversite Network (the original).
+# dashboard blocks are loaded. This branch IS the Oversite Roleplay codebase:
+# it started as a copy of the Network bot and is free to diverge from it.
 BOT_BASE = (os.getenv("BOT_BASE") or "roleplay").strip().lower()
 BASE_BRANDS = {"customs": "Oversite Customs", "roleplay": "Oversite Roleplay"}
 BRAND = BASE_BRANDS.get(BOT_BASE, "Oversite Customs")
@@ -2394,7 +2395,7 @@ async def refresh_status():
     try:
         await bot.change_presence(
             status=discord.Status.online,
-            activity=discord.Activity(type=discord.ActivityType.watching, name=f"Overseeing {total} members"),
+            activity=discord.Activity(type=discord.ActivityType.watching, name=f"Watching over {total} roleplayers"),
         )
     except Exception as e:
         print(f"[Status] update failed: {e}")

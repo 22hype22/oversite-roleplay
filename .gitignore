@@ -1,4 +1,5 @@
-__pycache__/
-*.pyc
+
+# VPS secrets
+deploy/.env
 .venv/
-.env
+__pycache__/
