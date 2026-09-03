@@ -10234,6 +10234,9 @@ async def fire_online_status():
         print(f"[Boot] online status failed: {e}")
 
 
+_hb_warned = False
+
+
 @tasks.loop(seconds=30)
 async def send_heartbeat():
     if not (BOT_ORDER_ID and WORKER_TOKEN):
@@ -10241,11 +10244,20 @@ async def send_heartbeat():
     try:
         guilds = [{"id": str(g.id), "name": g.name, "member_count": g.member_count or 0} for g in bot.guilds]
         session = await get_poll_session()
-        await session.post(
+        async with session.post(
             f"{SUPABASE_FN_URL}/{BOT_API}/heartbeat",
             headers=_fn_headers(),
             json={"bot_id": BOT_ORDER_ID, "status": "online", "guilds": guilds},
-        )
+        ) as r:
+            # A rejected heartbeat is what makes the dashboard think the bot is
+            # down, so say so in the log instead of failing silently.
+            if r.status != 200:
+                global _hb_warned
+                if not _hb_warned:
+                    _hb_warned = True
+                    print(f"[Heartbeat] rejected: HTTP {r.status} {(await r.text())[:160]}")
+            else:
+                _hb_warned = False
     except Exception as e:
         print(f"[Heartbeat] error: {e}")
 
