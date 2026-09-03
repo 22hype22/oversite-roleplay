@@ -46,7 +46,7 @@ BASE_COMMANDS = {
         "ticketadd", "ticketremove", "joinsetup", "infraction", "promote", "infractionroles",
         "promotionroles", "grouproleupdate", "logtest", "logdebug",
         # community
-        "giveaway", "shift", "suggestion", "blacklist", "unblacklist", "leaderboard", "invitebonus",
+        "giveaway", "shift", "session", "suggestion", "blacklist", "unblacklist", "leaderboard", "invitebonus",
         "resetinvites", "ads", "adsgrant",
         # music, radio, text to speech
         "join", "leave", "set", "play", "skip", "stop", "pause", "resume", "queue", "volume",
@@ -57,7 +57,7 @@ BASE_COMMANDS = {
 BASE_FEATURES = {
     "roleplay": {
         "welcome", "invite", "tickets", "roblox-verify", "customs-giveaway", "customs-infraction",
-        "customs-promotion", "customs-logging", "music-addon", "auto-radio", "roleplay-shifts",
+        "customs-promotion", "customs-logging", "music-addon", "auto-radio", "roleplay-shifts", "roleplay-sessions",
         "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-blacklist",
         "customs-smallui", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling",
     },
@@ -1409,6 +1409,10 @@ async def on_ready():
         print(f"[Blacklist] saved-roles load failed: {e}")
     if not ticket_inactivity_tick.is_running():
         ticket_inactivity_tick.start()
+    try:
+        await _session_load()
+    except Exception as e:
+        print(f"[Session] load failed: {e}")
     try:
         await _shift_load()
     except Exception as e:
@@ -4091,6 +4095,10 @@ async def on_interaction(interaction: discord.Interaction):
         await _dispatch_ticket_open(interaction, cid)
     elif cid == "ticket_open":
         await _dispatch_ticket_open(interaction, "ticket_open")
+    elif cid == "session_action":
+        await _session_select(interaction)
+    elif cid == "session_vote":
+        await _session_vote_click(interaction)
     elif cid.startswith("shift_"):
         await _shift_button(interaction, cid)
     elif cid == "ticket_claim":
@@ -5363,6 +5371,258 @@ async def shift_tick():
 @shift_tick.before_loop
 async def _shift_before():
     await bot.wait_until_ready()
+
+
+# ===================== Sessions (ER:LC server sessions) =====================
+# /session manage opens a staff panel whose menu is fixed (Start a vote, Start
+# session, Boost, End session) while every message it posts comes from the
+# dashboard Sessions block. A vote message carries a fixed Vote button that
+# counts unique voters until the needed number is reached.
+def _v2_text(text):
+    return [{"type": "container", "children": [{"type": "text", "text": text}]}]
+
+
+SESSION_DEFAULTS = {
+    "panel": _v2_text("## Session manager\nPick what to do from the menu below."),
+    "vote": _v2_text("## Session vote\n{ping} A session vote has started. Press Vote below if you can play.\n{votes} of {needed} votes so far."),
+    "start": _v2_text("## Session started\n{ping} The server is up, join in game now.\nStarted by {user}."),
+    "boost": _v2_text("## Session boost\n{ping} We need more players in the server right now. Come join."),
+    "end": _v2_text("## Session ended\n{ping} The server has shut down. Thanks to everyone who joined.\nEnded by {user}."),
+}
+session_config = {"manager_role_ids": [], "channel_id": "", "ping_role_id": "", "vote_needed": 5,
+                  "designs": {k: [] for k in SESSION_DEFAULTS}}
+session_data = {}   # guild_id -> {"active", "start_ts", "started_by", "vote": {"message_id","channel_id","voters","needed","by","passed"}}
+_session_loaded = False
+SESSION_ACTIONS = [
+    ("vote", "Start a session vote", "Post a vote and let players press Vote"),
+    ("start", "Start the session", "Announce the server is up"),
+    ("boost", "Boost the session", "Ask for more players"),
+    ("end", "End the session", "Announce the shutdown"),
+]
+
+
+async def _session_load():
+    global _session_loaded
+    ok, cfg = await _durable_config_get("session-data")
+    if not ok:
+        print("[Session] load failed, sessions disabled this session.")
+        return
+    g = (cfg or {}).get("guilds")
+    if isinstance(g, dict):
+        for gid, d in g.items():
+            if isinstance(d, dict):
+                session_data[str(gid)] = d
+    _session_loaded = True
+    print(f"[Session] loaded, {sum(1 for d in session_data.values() if d.get('active'))} active")
+
+
+async def _session_save():
+    if not _session_loaded:
+        return
+    try:
+        await _bot_config_upsert("session-data", {"guilds": session_data})
+    except Exception as e:
+        print(f"[Session] save failed: {e}")
+
+
+def _session_guild(gid):
+    return session_data.setdefault(str(gid), {"active": False, "start_ts": 0, "started_by": "", "vote": None})
+
+
+def _session_design(key):
+    d = (session_config.get("designs") or {}).get(key)
+    return d if isinstance(d, list) and d else SESSION_DEFAULTS[key]
+
+
+def _session_can_manage(member):
+    try:
+        if member.guild_permissions.manage_guild:
+            return True
+    except Exception:
+        pass
+    return has_any_role(member, session_config.get("manager_role_ids") or [])
+
+
+def _session_mapping(guild, user=None, **extra):
+    d = _session_guild(guild.id)
+    rid = str(session_config.get("ping_role_id") or "")
+    vote = d.get("vote") or {}
+    m = {
+        "user": user.mention if user else "", "ping": f"<@&{rid}>" if rid.isdigit() else "",
+        "votes": str(len(vote.get("voters") or [])), "needed": str(vote.get("needed") or session_config.get("vote_needed") or 0),
+        "started_at": f"<t:{int(d.get('start_ts') or 0)}:t>" if d.get("start_ts") else "",
+        "started_by": f"<@{d['started_by']}>" if d.get("started_by") else "",
+    }
+    m.update(extra)
+    return m
+
+
+def _session_allowed_mentions():
+    rid = str(session_config.get("ping_role_id") or "")
+    return {"parse": ["users"], "roles": [rid]} if rid.isdigit() else {"parse": ["users"]}
+
+
+async def _v2_respond(interaction, comps, rows=None, note=None, update=False, ephemeral=True):
+    """Answer a slash command (type 4) or update the clicked message (type 7)
+    with a designed Components V2 message plus fixed rows underneath."""
+    built = [b for b in (_build_v2(c, interaction.guild) for c in comps) if b]
+    if note:
+        built.append({"type": 10, "content": str(note)})
+    for row in (rows or []):
+        built.append(row)
+    flags = 1 << 15
+    if ephemeral:
+        flags |= 1 << 6
+    data = {"flags": flags, "components": built, "allowed_mentions": {"parse": []}}
+    route = discord.http.Route("POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+                               interaction_id=interaction.id, interaction_token=interaction.token)
+    await bot.http.request(route, json={"type": 7 if update else 4, "data": data})
+
+
+def _session_menu_row():
+    return {"type": 1, "components": [{"type": 3, "custom_id": "session_action", "placeholder": "What do you want to do?",
+                                       "options": [{"label": lbl, "value": v, "description": desc} for v, lbl, desc in SESSION_ACTIONS]}]}
+
+
+async def _session_panel(interaction, note=None, update=False):
+    design = _ui_render(_session_design("panel"), _session_mapping(interaction.guild, interaction.user))
+    await _v2_respond(interaction, design, rows=[_session_menu_row()], note=note, update=update)
+
+
+def _session_vote_button(vote, disabled=False):
+    n, needed = len(vote.get("voters") or []), int(vote.get("needed") or 0)
+    label = f"Vote, {n} of {needed}" if not vote.get("passed") else f"Vote passed, {n} of {needed}"
+    return {"type": 2, "style": 3 if vote.get("passed") else 1, "custom_id": "session_vote", "label": label[:80], "disabled": disabled}
+
+
+async def _session_edit_vote(guild, disabled=False):
+    d = _session_guild(guild.id)
+    vote = d.get("vote")
+    if not vote or not vote.get("message_id"):
+        return
+    ch = guild.get_channel(int(vote["channel_id"])) if str(vote.get("channel_id")).isdigit() else None
+    if not ch:
+        return
+    comps = _ui_render(_session_design("vote"), _session_mapping(guild, guild.get_member(int(vote["by"])) if str(vote.get("by")).isdigit() else None))
+    built = [b for b in (_build_v2(c, guild) for c in comps) if b]
+    built.append({"type": 1, "components": [_session_vote_button(vote, disabled)]})
+    route = discord.http.Route("PATCH", "/channels/{channel_id}/messages/{message_id}", channel_id=ch.id, message_id=int(vote["message_id"]))
+    try:
+        await bot.http.request(route, json={"components": built, "flags": 1 << 15, "allowed_mentions": {"parse": []}})
+    except Exception as e:
+        print(f"[Session] vote edit failed: {e}")
+
+
+async def _session_channel(interaction):
+    ch = await resolve_channel(session_config.get("channel_id"))
+    return ch or interaction.channel
+
+
+async def _session_do(interaction, action):
+    guild, user = interaction.guild, interaction.user
+    d = _session_guild(guild.id)
+    ch = await _session_channel(interaction)
+    if action == "vote":
+        needed = max(1, int(session_config.get("vote_needed") or 5))
+        vote = {"message_id": "", "channel_id": str(ch.id), "voters": [], "needed": needed, "by": str(user.id), "passed": False}
+        d["vote"] = vote
+        comps = _ui_render(_session_design("vote"), _session_mapping(guild, user))
+        mid = await send_v2_message(ch, comps, buttons=[_session_vote_button(vote)], allowed_mentions=_session_allowed_mentions())
+        vote["message_id"] = str(mid) if isinstance(mid, str) else ""
+        await _session_save()
+        return f"Vote posted in {ch.mention}. It passes at {needed} votes."
+    if action == "start":
+        d["active"], d["start_ts"], d["started_by"] = True, int(time.time()), str(user.id)
+        if d.get("vote"):
+            d["vote"]["passed"] = True
+            await _session_edit_vote(guild, disabled=True)
+            d["vote"] = None
+        comps = _ui_render(_session_design("start"), _session_mapping(guild, user))
+        await send_v2_message(ch, comps, allowed_mentions=_session_allowed_mentions())
+        await _session_save()
+        return f"Session started, announced in {ch.mention}."
+    if action == "boost":
+        if not d.get("active"):
+            return "There's no session running. Start one first."
+        comps = _ui_render(_session_design("boost"), _session_mapping(guild, user))
+        await send_v2_message(ch, comps, allowed_mentions=_session_allowed_mentions())
+        return f"Boost posted in {ch.mention}."
+    if action == "end":
+        if not d.get("active") and not d.get("vote"):
+            return "There's no session running."
+        d["active"], d["start_ts"], d["started_by"] = False, 0, ""
+        if d.get("vote"):
+            await _session_edit_vote(guild, disabled=True)
+            d["vote"] = None
+        comps = _ui_render(_session_design("end"), _session_mapping(guild, user))
+        await send_v2_message(ch, comps, allowed_mentions=_session_allowed_mentions())
+        await _session_save()
+        return f"Session ended, announced in {ch.mention}."
+    return "Unknown action."
+
+
+async def _session_select(interaction):
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not _session_can_manage(member):
+        return await interaction.response.send_message(embed=error_embed("Staff only", "You don't have a role that can manage sessions."), ephemeral=True)
+    vals = (interaction.data or {}).get("values") or []
+    action = vals[0] if vals else ""
+    try:
+        note = await _session_do(interaction, action)
+    except Exception as e:
+        print(f"[Session] {action} failed: {e}")
+        note = f"That didn't go through: {str(e)[:120]}"
+    await _session_panel(interaction, note=note, update=True)
+
+
+async def _session_vote_click(interaction):
+    guild, user = interaction.guild, interaction.user
+    d = _session_guild(guild.id)
+    vote = d.get("vote")
+    if not vote or str(interaction.message.id if interaction.message else "") != str(vote.get("message_id")):
+        return await interaction.response.send_message(embed=info_embed("Vote closed", "This vote isn't open anymore."), ephemeral=True)
+    if vote.get("passed"):
+        return await interaction.response.send_message(embed=info_embed("Vote passed", "This vote already passed. Staff can start the session."), ephemeral=True)
+    voters = list(vote.get("voters") or [])
+    uid = str(user.id)
+    if uid in voters:
+        voters.remove(uid)
+        msg = "Your vote was removed."
+    else:
+        voters.append(uid)
+        msg = "Your vote was counted."
+    vote["voters"] = voters
+    try:
+        await interaction.response.send_message(embed=success_embed("Session vote", msg), ephemeral=True)
+    except Exception:
+        pass
+    if len(voters) >= int(vote.get("needed") or 0):
+        vote["passed"] = True
+        by = f"<@{vote['by']}>" if str(vote.get("by")).isdigit() else "Staff"
+        ch = guild.get_channel(int(vote["channel_id"])) if str(vote.get("channel_id")).isdigit() else None
+        if ch:
+            try:
+                await send_v2_message(ch, _v2_text(f"{by} The vote passed with {len(voters)} votes. You can start the session from /session manage."),
+                                      allowed_mentions={"parse": ["users"]})
+            except Exception as e:
+                print(f"[Session] vote passed notice failed: {e}")
+    await _session_edit_vote(guild)
+    await _session_save()
+
+
+session_group = app_commands.Group(name="session", description="Server sessions")
+
+
+@session_group.command(name="manage", description="Start a vote, start, boost or end the session")
+async def session_manage_cmd(interaction: discord.Interaction):
+    if not _session_can_manage(interaction.user):
+        return await interaction.response.send_message(embed=error_embed("Staff only", "You don't have a role that can manage sessions."), ephemeral=True)
+    if not _session_loaded:
+        return await interaction.response.send_message(embed=error_embed("Try again", "Sessions aren't ready yet, give it a minute."), ephemeral=True)
+    await _session_panel(interaction)
+
+
+bot.tree.add_command(session_group)
 
 
 # ===================== Blacklist logs =====================
@@ -8417,6 +8677,21 @@ async def apply_config(feature, cfg, post_panel=False):
         _register_eph_from_tree(design)
         print(f"[Config] {feature} — channel {channel_id or '(none)'}, "
               f"{len(_pf_inputs(design))} form field(s)")
+    elif feature == "roleplay-sessions":
+        session_config["manager_role_ids"] = [str(x) for x in (cfg.get("manager_role_ids") or []) if x]
+        session_config["channel_id"] = str(cfg.get("channel_id") or "")
+        session_config["ping_role_id"] = str(cfg.get("ping_role_id") or "")
+        try:
+            session_config["vote_needed"] = max(1, int(cfg.get("vote_needed") or 5))
+        except (TypeError, ValueError):
+            session_config["vote_needed"] = 5
+        for k in SESSION_DEFAULTS:
+            v = cfg.get(f"{k}_components")
+            session_config["designs"][k] = v if isinstance(v, list) else []
+            _register_eph_from_tree(session_config["designs"][k])
+        print(f"[Config] roleplay-sessions, channel {session_config['channel_id'] or '(none)'} "
+              f"ping {session_config['ping_role_id'] or '(none)'} votes {session_config['vote_needed']} "
+              f"designs {[k for k, v in session_config['designs'].items() if v]}")
     elif feature == "roleplay-shifts":
         shift_config["staff_role_ids"] = [str(x) for x in (cfg.get("staff_role_ids") or []) if x]
         shift_config["onshift_role_ids"] = [str(x) for x in (cfg.get("onshift_role_ids") or []) if x]
@@ -10335,7 +10610,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID} (base {BOT_BASE})")
-    for feature in ("welcome", "invite", "tickets", "roblox-verify", "customs-giveaway", "customs-infraction", "customs-promotion", "customs-logging", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-blacklist", "customs-smallui", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling", "roleplay-shifts"):
+    for feature in ("welcome", "invite", "tickets", "roblox-verify", "customs-giveaway", "customs-infraction", "customs-promotion", "customs-logging", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-blacklist", "customs-smallui", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling", "roleplay-shifts", "roleplay-sessions"):
         if not _base_allows_feature(feature):
             continue
         cfg = await fetch_config(feature)
