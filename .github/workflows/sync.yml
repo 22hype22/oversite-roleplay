@@ -1,0 +1,62 @@
+# Lives in 22hype22/oversite-roleplay as .github/workflows/sync.yml
+# Pulls the bot code from the public oversite-customs repo into this one,
+# flips the BOT_BASE default to "roleplay", and commits. Runs when this file
+# lands, every hour, and on the Actions tab's "Run workflow" button.
+name: Sync from oversite-customs
+
+on:
+  push:
+    paths: [".github/workflows/sync.yml"]
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Copy the bot in from oversite-customs
+        run: |
+          set -e
+          git clone --depth 1 https://github.com/22hype22/oversite-customs /tmp/src
+          rm -rf music
+          cp /tmp/src/main.py /tmp/src/requirements.txt /tmp/src/Procfile /tmp/src/nixpacks.toml /tmp/src/runtime.txt .
+          cp -r /tmp/src/music music
+          rm -rf music/__pycache__
+          printf '__pycache__/\n*.pyc\n.venv/\n.env\n' > .gitignore
+          rm -f d
+          python3 - <<'PY'
+          p = "main.py"; s = open(p).read()
+          a = 'BOT_BASE = (os.getenv("BOT_BASE") or "customs").strip().lower()'
+          b = 'BOT_BASE = (os.getenv("BOT_BASE") or "roleplay").strip().lower()'
+          assert a in s, "BOT_BASE default line not found"
+          open(p, "w").write(s.replace(a, b))
+          PY
+          python3 -m py_compile main.py
+          [ -f CLAUDE.md ] || cat > CLAUDE.md <<'EOF'
+          # CLAUDE.md, Oversite Roleplay bot
+
+          Single-file discord.py bot (main.py). Auto-deploys to Railway from main.
+
+          This repo is a mirror of github.com/22hype22/oversite-customs kept in
+          sync by .github/workflows/sync.yml. Do not edit main.py here: change
+          oversite-customs, then run the sync workflow (or wait for the hourly run).
+          The only difference is the BOT_BASE default of "roleplay", which sets the
+          brand, the slash commands kept, and the dashboard blocks loaded.
+
+          Message rules: no emoji or symbol glyphs, no em dashes, no parentheses,
+          no AI voice. Ratings are written out, "4 out of 5".
+          EOF
+      - name: Commit and push
+        run: |
+          git config user.name "oversite-sync"
+          git config user.email "sync@oversite.shop"
+          git add -A
+          if git diff --cached --quiet; then echo "Already up to date."; exit 0; fi
+          SRC=$(git -C /tmp/src rev-parse --short HEAD)
+          git commit -m "Sync from oversite-customs $SRC"
+          git push
