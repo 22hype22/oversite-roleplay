@@ -46,7 +46,7 @@ BASE_COMMANDS = {
         "ticketadd", "ticketremove", "joinsetup", "infraction", "promote", "infractionroles",
         "promotionroles", "grouproleupdate", "logtest", "logdebug",
         # community
-        "giveaway", "suggestion", "blacklist", "unblacklist", "leaderboard", "invitebonus",
+        "giveaway", "shift", "suggestion", "blacklist", "unblacklist", "leaderboard", "invitebonus",
         "resetinvites", "ads", "adsgrant",
         # music, radio, text to speech
         "join", "leave", "set", "play", "skip", "stop", "pause", "resume", "queue", "volume",
@@ -57,7 +57,7 @@ BASE_COMMANDS = {
 BASE_FEATURES = {
     "roleplay": {
         "welcome", "invite", "tickets", "roblox-verify", "customs-giveaway", "customs-infraction",
-        "customs-promotion", "customs-logging", "music-addon", "auto-radio",
+        "customs-promotion", "customs-logging", "music-addon", "auto-radio", "roleplay-shifts",
         "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-blacklist",
         "customs-smallui", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling",
     },
@@ -1409,6 +1409,12 @@ async def on_ready():
         print(f"[Blacklist] saved-roles load failed: {e}")
     if not ticket_inactivity_tick.is_running():
         ticket_inactivity_tick.start()
+    try:
+        await _shift_load()
+    except Exception as e:
+        print(f"[Shift] load failed: {e}")
+    if not shift_tick.is_running():
+        shift_tick.start()
     if not ticket_staff_reply_tick.is_running():
         ticket_staff_reply_tick.start()
     if not econ_autosave.is_running():
@@ -4085,6 +4091,8 @@ async def on_interaction(interaction: discord.Interaction):
         await _dispatch_ticket_open(interaction, cid)
     elif cid == "ticket_open":
         await _dispatch_ticket_open(interaction, "ticket_open")
+    elif cid.startswith("shift_"):
+        await _shift_button(interaction, cid)
     elif cid == "ticket_claim":
         await ticket_claim_toggle(interaction, True)
     elif cid == "ticket_unclaim":
@@ -5028,6 +5036,333 @@ async def _pf_submit(interaction, feature, form_num=1):
 @bot.tree.command(name="suggestion", description="Share a suggestion")
 async def suggestion_cmd(interaction: discord.Interaction):
     await _pf_command(interaction, "customs-suggestions")
+
+
+# ===================== Shifts (staff activity) =====================
+# /shift manage opens a personal panel (start, end, break), /shift leaderboard
+# ranks time on shift, /shift online lists who is on now. Every message comes
+# from the dashboard Shifts block as a template with tokens. Shifts are
+# persisted (shift-data) so a redeploy never loses an open shift.
+SHIFT_DEFAULT_MANAGE = ("## Shift panel\n{status}\n\n**Total shift time:** {total_time}\n"
+                        "**Total break time:** {break_time}\n**Activity quota:** {quota}\n"
+                        "**Shifts this week:** {shifts}\n\n**Recent shifts**\n{recent}")
+SHIFT_DEFAULT_LEADERBOARD = "## Shift leaderboard, {period}\n{leaderboard}"
+SHIFT_DEFAULT_ONLINE = "## Staff on shift, {count}\n{online}"
+shift_config = {
+    "staff_role_ids": [], "onshift_role_ids": [], "quota_hours": 0.0, "log_channel_id": "",
+    "manage_message": SHIFT_DEFAULT_MANAGE, "leaderboard_message": SHIFT_DEFAULT_LEADERBOARD,
+    "online_message": SHIFT_DEFAULT_ONLINE,
+}
+shift_data = {}   # guild_id -> {"active": {uid: {"start", "break_start", "break_total"}}, "history": {uid: [...]}}
+_shift_loaded = False
+SHIFT_MAX_SECONDS = 12 * 3600      # a forgotten shift ends itself after this long
+SHIFT_HISTORY_KEEP = 300           # shifts kept per person
+
+
+async def _shift_load():
+    global _shift_loaded
+    ok, cfg = await _durable_config_get("shift-data")
+    if not ok:
+        print("[Shift] load failed, shifts disabled this session.")
+        return
+    g = (cfg or {}).get("guilds")
+    if isinstance(g, dict):
+        for gid, d in g.items():
+            if isinstance(d, dict):
+                shift_data[str(gid)] = {
+                    "active": {str(u): v for u, v in (d.get("active") or {}).items() if isinstance(v, dict)},
+                    "history": {str(u): [x for x in (lst or []) if isinstance(x, dict)]
+                                for u, lst in (d.get("history") or {}).items()},
+                }
+    _shift_loaded = True
+    print(f"[Shift] loaded, {sum(len(d['active']) for d in shift_data.values())} shift(s) open")
+
+
+async def _shift_save():
+    if not _shift_loaded:
+        return
+    try:
+        await _bot_config_upsert("shift-data", {"guilds": shift_data})
+    except Exception as e:
+        print(f"[Shift] save failed: {e}")
+
+
+def _shift_guild(gid):
+    return shift_data.setdefault(str(gid), {"active": {}, "history": {}})
+
+
+def _shift_week_start():
+    """Monday 00:00 Central, as a unix timestamp. The quota and the weekly
+    leaderboard both count from here."""
+    central = datetime.timezone(datetime.timedelta(hours=-5))
+    now = datetime.datetime.now(central)
+    start = (now - datetime.timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.timestamp()
+
+
+def _fmt_dur(secs):
+    secs = int(max(0, secs))
+    h, m = secs // 3600, (secs % 3600) // 60
+    if h and m:
+        return f"{h} hour{'s' if h != 1 else ''} {m} minute{'s' if m != 1 else ''}"
+    if h:
+        return f"{h} hour{'s' if h != 1 else ''}"
+    if m:
+        return f"{m} minute{'s' if m != 1 else ''}"
+    return f"{secs} second{'s' if secs != 1 else ''}"
+
+
+def _shift_active_elapsed(a, now=None):
+    """(worked_seconds, break_seconds) for an open shift."""
+    now = now or time.time()
+    brk = float(a.get("break_total") or 0)
+    if a.get("break_start"):
+        brk += now - float(a["break_start"])
+    return max(0.0, now - float(a["start"]) - brk), brk
+
+
+def _shift_totals(gid, uid, since_ts=0):
+    """(worked, break, count) for one person since a time, open shift included."""
+    g = _shift_guild(gid)
+    worked = brk = 0.0
+    count = 0
+    for h in g["history"].get(str(uid), []):
+        if float(h.get("end") or 0) >= since_ts:
+            worked += float(h.get("duration") or 0)
+            brk += float(h.get("break") or 0)
+            count += 1
+    a = g["active"].get(str(uid))
+    if a:
+        w, b = _shift_active_elapsed(a)
+        worked += w
+        brk += b
+        count += 1
+    return worked, brk, count
+
+
+def _shift_can_use(member):
+    roles = shift_config.get("staff_role_ids") or []
+    if not roles:
+        return True
+    return has_any_role(member, roles)
+
+
+def _shift_status_text(a):
+    if not a:
+        return "You're offline."
+    if a.get("break_start"):
+        return f"You're on break, on shift since <t:{int(float(a['start']))}:t>."
+    return f"You're on shift since <t:{int(float(a['start']))}:t>."
+
+
+def _shift_manage_mapping(member):
+    g = _shift_guild(member.guild.id)
+    a = g["active"].get(str(member.id))
+    week = _shift_week_start()
+    worked, brk, count = _shift_totals(member.guild.id, member.id, week)
+    quota_h = float(shift_config.get("quota_hours") or 0)
+    if quota_h > 0:
+        pct = int(round(worked / (quota_h * 3600) * 100))
+        quota = f"{pct}% of {_fmt_dur(quota_h * 3600)}, " + ("met" if pct >= 100 else "not met yet")
+    else:
+        quota = "No quota set"
+    recent = []
+    hist = sorted(g["history"].get(str(member.id), []), key=lambda h: float(h.get("end") or 0), reverse=True)[:3]
+    for h in hist:
+        recent.append(f"<t:{int(float(h.get('start') or 0))}:t> to <t:{int(float(h.get('end') or 0))}:t>, {_fmt_dur(h.get('duration') or 0)}")
+    return {
+        "user": member.mention, "status": _shift_status_text(a), "total_time": _fmt_dur(worked),
+        "break_time": _fmt_dur(brk), "quota": quota, "shifts": str(count),
+        "recent": "\n".join(recent) if recent else "No shifts yet this week.",
+        "week_start": f"<t:{int(week)}:D>",
+    }
+
+
+def _shift_fill(template, mapping, guild):
+    out = str(template or "")
+    for k, v in mapping.items():
+        out = out.replace("{" + k + "}", str(v))
+    return _render_guild_text(out, guild)
+
+
+def _shift_buttons(a):
+    if not a:
+        return [{"type": 2, "style": 3, "custom_id": "shift_start", "label": "Start shift"}]
+    if a.get("break_start"):
+        return [{"type": 2, "style": 1, "custom_id": "shift_unbreak", "label": "End break"},
+                {"type": 2, "style": 4, "custom_id": "shift_end", "label": "End shift"}]
+    return [{"type": 2, "style": 2, "custom_id": "shift_break", "label": "Start break"},
+            {"type": 2, "style": 4, "custom_id": "shift_end", "label": "End shift"},
+            {"type": 2, "style": 2, "custom_id": "shift_refresh", "label": "Refresh"}]
+
+
+async def _shift_respond(interaction, text, buttons=None, update=False, ephemeral=True):
+    """Answer a slash command (type 4) or update the clicked panel (type 7)
+    with one Components V2 container."""
+    built = [b for b in (_build_v2(c, interaction.guild) for c in [{"type": "container", "children": [{"type": "text", "text": text}]}]) if b]
+    if buttons:
+        built.append({"type": 1, "components": buttons})
+    flags = 1 << 15
+    if ephemeral:
+        flags |= 1 << 6
+    data = {"flags": flags, "components": built, "allowed_mentions": {"parse": []}}
+    route = discord.http.Route("POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+                               interaction_id=interaction.id, interaction_token=interaction.token)
+    await bot.http.request(route, json={"type": 7 if update else 4, "data": data})
+
+
+async def _shift_panel(interaction, update=False):
+    member = interaction.user
+    a = _shift_guild(member.guild.id)["active"].get(str(member.id))
+    text = _shift_fill(shift_config.get("manage_message") or SHIFT_DEFAULT_MANAGE, _shift_manage_mapping(member), member.guild)
+    await _shift_respond(interaction, text, buttons=_shift_buttons(a), update=update)
+
+
+async def _shift_roles(member, give):
+    ids = [int(r) for r in (shift_config.get("onshift_role_ids") or []) if str(r).isdigit()]
+    roles = [member.guild.get_role(i) for i in ids]
+    roles = [r for r in roles if r]
+    if not roles:
+        return
+    try:
+        if give:
+            await member.add_roles(*roles, reason="On shift")
+        else:
+            await member.remove_roles(*roles, reason="Shift ended")
+    except Exception as e:
+        print(f"[Shift] role change failed for {member.id}: {e}")
+
+
+async def _shift_log(guild, text):
+    ch = await resolve_channel(shift_config.get("log_channel_id"))
+    if not ch:
+        return
+    try:
+        await send_v2_message(ch, [{"type": "container", "children": [{"type": "text", "text": text}]}],
+                              allowed_mentions={"parse": []})
+    except Exception as e:
+        print(f"[Shift] log failed: {e}")
+
+
+async def _shift_end_for(guild, uid, reason=""):
+    """Close a shift, record it, drop the roles. Returns the record or None."""
+    g = _shift_guild(guild.id)
+    a = g["active"].pop(str(uid), None)
+    if not a:
+        return None
+    now = time.time()
+    worked, brk = _shift_active_elapsed(a, now)
+    rec = {"start": float(a["start"]), "end": now, "duration": worked, "break": brk}
+    hist = g["history"].setdefault(str(uid), [])
+    hist.append(rec)
+    if len(hist) > SHIFT_HISTORY_KEEP:
+        del hist[:-SHIFT_HISTORY_KEEP]
+    member = guild.get_member(int(uid))
+    if member:
+        await _shift_roles(member, False)
+    await _shift_save()
+    who = member.mention if member else f"<@{uid}>"
+    await _shift_log(guild, f"{who} ended a shift, {_fmt_dur(worked)}" + (f", {reason}" if reason else "") + ".")
+    return rec
+
+
+async def _shift_button(interaction, cid):
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not _shift_can_use(member):
+        return await interaction.response.send_message(embed=error_embed("Staff only", "You don't have a role that can use shifts."), ephemeral=True)
+    g = _shift_guild(member.guild.id)
+    a = g["active"].get(str(member.id))
+    now = time.time()
+    if cid == "shift_start":
+        if not a:
+            g["active"][str(member.id)] = {"start": now, "break_start": 0, "break_total": 0}
+            await _shift_roles(member, True)
+            await _shift_save()
+            await _shift_log(member.guild, f"{member.mention} started a shift.")
+    elif cid == "shift_end":
+        if a:
+            await _shift_end_for(member.guild, member.id)
+    elif cid == "shift_break":
+        if a and not a.get("break_start"):
+            a["break_start"] = now
+            await _shift_save()
+    elif cid == "shift_unbreak":
+        if a and a.get("break_start"):
+            a["break_total"] = float(a.get("break_total") or 0) + (now - float(a["break_start"]))
+            a["break_start"] = 0
+            await _shift_save()
+    await _shift_panel(interaction, update=True)
+
+
+shift_group = app_commands.Group(name="shift", description="Staff shifts")
+
+
+@shift_group.command(name="manage", description="Start, pause or end your shift and see your time")
+async def shift_manage_cmd(interaction: discord.Interaction):
+    if not _shift_can_use(interaction.user):
+        return await interaction.response.send_message(embed=error_embed("Staff only", "You don't have a role that can use shifts."), ephemeral=True)
+    if not _shift_loaded:
+        return await interaction.response.send_message(embed=error_embed("Try again", "Shifts aren't ready yet, give it a minute."), ephemeral=True)
+    await _shift_panel(interaction)
+
+
+@shift_group.command(name="leaderboard", description="Who has been on shift the most")
+@app_commands.describe(period="This week (default) or all time")
+@app_commands.choices(period=[app_commands.Choice(name="This week", value="week"), app_commands.Choice(name="All time", value="all")])
+async def shift_leaderboard_cmd(interaction: discord.Interaction, period: app_commands.Choice[str] = None):
+    guild = interaction.guild
+    p = period.value if period else "week"
+    since = _shift_week_start() if p == "week" else 0
+    g = _shift_guild(guild.id)
+    uids = set(g["history"].keys()) | set(g["active"].keys())
+    rows = []
+    for uid in uids:
+        worked, _brk, count = _shift_totals(guild.id, uid, since)
+        if worked > 0:
+            rows.append((worked, count, uid))
+    rows.sort(reverse=True)
+    lines = [f"{i + 1}. <@{uid}>, {_fmt_dur(w)}, {c} shift{'s' if c != 1 else ''}" for i, (w, c, uid) in enumerate(rows[:15])]
+    mapping = {"leaderboard": "\n".join(lines) if lines else "Nobody has been on shift yet.",
+               "period": "this week" if p == "week" else "all time", "week_start": f"<t:{int(_shift_week_start())}:D>"}
+    text = _shift_fill(shift_config.get("leaderboard_message") or SHIFT_DEFAULT_LEADERBOARD, mapping, guild)
+    await _shift_respond(interaction, text, ephemeral=False)
+
+
+@shift_group.command(name="online", description="Who is on shift right now")
+async def shift_online_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    g = _shift_guild(guild.id)
+    lines = []
+    for uid, a in sorted(g["active"].items(), key=lambda kv: float(kv[1].get("start") or 0)):
+        worked, _brk = _shift_active_elapsed(a)
+        state = ", on break" if a.get("break_start") else ""
+        lines.append(f"<@{uid}>, on shift for {_fmt_dur(worked)}{state}")
+    mapping = {"online": "\n".join(lines) if lines else "Nobody is on shift right now.", "count": str(len(lines))}
+    text = _shift_fill(shift_config.get("online_message") or SHIFT_DEFAULT_ONLINE, mapping, guild)
+    await _shift_respond(interaction, text, ephemeral=False)
+
+
+bot.tree.add_command(shift_group)
+
+
+@tasks.loop(minutes=10)
+async def shift_tick():
+    """End shifts that have run past the cap, so a forgotten shift doesn't count forever."""
+    if not _shift_loaded:
+        return
+    now = time.time()
+    for gid, d in list(shift_data.items()):
+        guild = bot.get_guild(int(gid)) if str(gid).isdigit() else None
+        if not guild:
+            continue
+        for uid, a in list(d["active"].items()):
+            if now - float(a.get("start") or now) >= SHIFT_MAX_SECONDS:
+                await _shift_end_for(guild, uid, reason="ended automatically after 12 hours")
+
+
+@shift_tick.before_loop
+async def _shift_before():
+    await bot.wait_until_ready()
 
 
 # ===================== Blacklist logs =====================
@@ -8082,6 +8417,21 @@ async def apply_config(feature, cfg, post_panel=False):
         _register_eph_from_tree(design)
         print(f"[Config] {feature} — channel {channel_id or '(none)'}, "
               f"{len(_pf_inputs(design))} form field(s)")
+    elif feature == "roleplay-shifts":
+        shift_config["staff_role_ids"] = [str(x) for x in (cfg.get("staff_role_ids") or []) if x]
+        shift_config["onshift_role_ids"] = [str(x) for x in (cfg.get("onshift_role_ids") or []) if x]
+        try:
+            shift_config["quota_hours"] = max(0.0, float(cfg.get("quota_hours") or 0))
+        except (TypeError, ValueError):
+            shift_config["quota_hours"] = 0.0
+        shift_config["log_channel_id"] = str(cfg.get("log_channel_id") or "")
+        for k, default in (("manage_message", SHIFT_DEFAULT_MANAGE), ("leaderboard_message", SHIFT_DEFAULT_LEADERBOARD),
+                           ("online_message", SHIFT_DEFAULT_ONLINE)):
+            v = cfg.get(k)
+            shift_config[k] = str(v) if isinstance(v, str) and v.strip() else default
+        print(f"[Config] roleplay-shifts, staff roles {len(shift_config['staff_role_ids'])} "
+              f"on-shift roles {len(shift_config['onshift_role_ids'])} quota {shift_config['quota_hours']}h "
+              f"log {shift_config['log_channel_id'] or '(none)'}")
     elif feature in ("customs-blacklist",):
         raw = cfg.get("messages")
         design, channel_id = [], ""
@@ -9985,7 +10335,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID} (base {BOT_BASE})")
-    for feature in ("welcome", "invite", "tickets", "roblox-verify", "customs-giveaway", "customs-infraction", "customs-promotion", "customs-logging", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-blacklist", "customs-smallui", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling"):
+    for feature in ("welcome", "invite", "tickets", "roblox-verify", "customs-giveaway", "customs-infraction", "customs-promotion", "customs-logging", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-blacklist", "customs-smallui", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling", "roleplay-shifts"):
         if not _base_allows_feature(feature):
             continue
         cfg = await fetch_config(feature)
