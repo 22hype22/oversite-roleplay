@@ -1432,8 +1432,19 @@ async def on_ready():
             pruned = _prune_commands_for_base()
             if pruned:
                 print(f"[Boot] base {BOT_BASE}: {pruned} command(s) not in this product, removed before sync")
-            synced = await bot.tree.sync()
-            print(f"Synced {len(synced)} commands")
+            # Discord's bulk command overwrite is slow and rate limited (it has
+            # taken 45s on a busy day). Only sync when the command set actually
+            # changed since the last successful sync.
+            fp = _tree_fingerprint()
+            _fp_ok, prev = await _durable_config_get("command-sync", attempts=2)
+            synced = []
+            if _fp_ok and isinstance(prev, dict) and prev.get("fingerprint") == fp:
+                print(f"[Boot] {len(bot.tree.get_commands())} commands unchanged since the last sync, skipping")
+            else:
+                synced = await bot.tree.sync()
+                print(f"Synced {len(synced)} commands")
+                await _bot_config_upsert("command-sync", {"fingerprint": fp, "count": len(synced),
+                                                          "at": int(time.time())})
             for cmd in synced:
                 if cmd.name == "package":
                     for opt in getattr(cmd, "options", []):
@@ -1443,6 +1454,17 @@ async def on_ready():
                                   f"(15=forum, 16=media expected)")
     except Exception as e:
         print(f"Sync error: {e}")
+
+
+def _tree_fingerprint():
+    """A stable hash of every slash command (names, descriptions, options), so
+    a boot can tell whether Discord already has this exact command set."""
+    try:
+        payload = [c.to_dict() for c in bot.tree.get_commands()]
+        raw = json.dumps(payload, sort_keys=True, default=str)
+    except Exception as e:
+        return f"error:{e}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 async def _order_policy():
@@ -10610,10 +10632,20 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID} (base {BOT_BASE})")
-    for feature in ("welcome", "invite", "tickets", "roblox-verify", "customs-giveaway", "customs-infraction", "customs-promotion", "customs-logging", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-blacklist", "customs-smallui", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling", "roleplay-shifts", "roleplay-sessions"):
-        if not _base_allows_feature(feature):
-            continue
-        cfg = await fetch_config(feature)
+    features = [f for f in ("welcome", "invite", "tickets", "roblox-verify", "customs-giveaway", "customs-infraction", "customs-promotion", "customs-logging", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-blacklist", "customs-smallui", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling", "roleplay-shifts", "roleplay-sessions") if _base_allows_feature(f)]
+    # Fetch every config at once (a few at a time) instead of one after another:
+    # this used to be ~15s of serial round trips on every boot. Apply in the
+    # original order so panels and sources register exactly as before.
+    sem = asyncio.Semaphore(8)
+
+    async def _fetch_one(f):
+        async with sem:
+            return f, await fetch_config(f)
+
+    t0 = time.time()
+    results = await asyncio.gather(*(_fetch_one(f) for f in features))
+    print(f"[Config] fetched {len(results)} config(s) in {time.time() - t0:.1f}s")
+    for feature, cfg in results:
         if cfg:
             await apply_config(feature, cfg)
         else:
