@@ -8204,8 +8204,12 @@ def _build_v2(comp, guild):
                 value = f"url:{url}"[:100]
             else:
                 value = label[:100]
-            opt_label, opt_emoji = _extract_button_emoji(label)
-            o = {"label": (opt_label or label)[:100], "value": value[:100]}
+            # Resolve :emoji: shortcodes and text variables the same way button
+            # labels do, so an option typed as ":Refined: .refined" shows the
+            # emoji instead of the raw shortcode.
+            shown = _render_guild_text(label, guild)
+            opt_label, opt_emoji = _extract_button_emoji(shown)
+            o = {"label": (opt_label or shown or label)[:100], "value": value[:100]}
             if opt_emoji:
                 o["emoji"] = opt_emoji
             if opt.get("description"):
