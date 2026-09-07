@@ -4044,6 +4044,29 @@ async def on_raw_message_delete(payload):
             print(f"[Giveaway] {gid} message {mid} was deleted — dropped from tracking")
 
 
+async def _select_jump(interaction, value):
+    """A menu option that points at a link or a channel. Menus cannot open a
+    link on their own, so answer with a small private message that does."""
+    try:
+        if value.startswith("url:"):
+            url = value[4:]
+            view = discord.ui.View()
+            try:
+                view.add_item(discord.ui.Button(label="Open", url=url))
+            except Exception:
+                view = None
+            await interaction.response.send_message(content=url, view=view, ephemeral=True)
+        else:
+            cid = value[3:]
+            await interaction.response.send_message(content=f"<#{cid}>" if cid.isdigit() else "That channel is not set up.", ephemeral=True)
+    except Exception as e:
+        print(f"[Select] jump failed for {value!r}: {e}")
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     # Form submits arrive as modal_submit interactions (not component). Handle
@@ -4093,12 +4116,24 @@ async def on_interaction(interaction: discord.Interaction):
             elif v.startswith("eph:"):
                 await show_ephemeral(interaction, v.split(":", 1)[1])
             elif v.startswith("ch:") or v.startswith("url:"):
-                try:
-                    await interaction.response.defer(ephemeral=True)
-                except Exception:
-                    pass
+                await _select_jump(interaction, v)
             else:
                 await _dispatch_ticket_open(interaction, v)
+    elif cid.startswith("select_"):
+        # A designed menu with no ticket options, only links, channels, or
+        # ephemeral messages. Without a reply here Discord shows "didn't
+        # respond in time" when someone picks one.
+        values = (interaction.data or {}).get("values") or []
+        v = values[0] if values else ""
+        if v.startswith("eph:"):
+            await show_ephemeral(interaction, v.split(":", 1)[1])
+        elif v.startswith("ch:") or v.startswith("url:"):
+            await _select_jump(interaction, v)
+        else:
+            try:
+                await interaction.response.defer(ephemeral=True)
+            except Exception:
+                pass
     elif cid.startswith("ticket_msg:"):
         await _dispatch_ticket_open(interaction, cid)
     elif cid.startswith("ticket_form:"):
