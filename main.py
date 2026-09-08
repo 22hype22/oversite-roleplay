@@ -627,7 +627,7 @@ async def _ads_fetch_data():
     if not (SUPABASE_URL and SUPABASE_KEY and BOT_ORDER_ID):
         return True, None  # no backend configured — nothing to lose
     url = f"{SUPABASE_URL}/rest/v1/bot_config?bot_id=eq.{BOT_ORDER_ID}&feature=eq.ads-data&select=config"
-    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    headers = {"x-worker-token": WORKER_TOKEN, "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     attempts = 5
     for i in range(attempts):
         last = i == attempts - 1
@@ -1269,7 +1269,7 @@ async def runtime_rpc(name, payload):
         async with _http() as client:
             r = await client.post(
                 f"{SUPABASE_URL}/rest/v1/rpc/{name}",
-                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"},
+                headers={"x-worker-token": WORKER_TOKEN, "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"},
                 json=payload,
                 timeout=10,
             )
@@ -3571,7 +3571,7 @@ async def _bot_config_get(feature):
     try:
         url = f"{SUPABASE_URL}/rest/v1/bot_config?bot_id=eq.{BOT_ORDER_ID}&feature=eq.{feature}&select=config"
         async with _http() as client:
-            r = await client.get(url, headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=15)
+            r = await client.get(url, headers={"x-worker-token": WORKER_TOKEN, "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=15)
         if r.status_code == 200 and r.json():
             return r.json()[0].get("config") or {}
     except Exception as e:
@@ -3588,7 +3588,7 @@ async def _durable_config_get(feature, attempts=6):
         return True, {}
     url = (f"{SUPABASE_URL}/rest/v1/bot_config?bot_id=eq.{BOT_ORDER_ID}"
            f"&feature=eq.{feature}&select=config")
-    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    headers = {"x-worker-token": WORKER_TOKEN, "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     err = ""
     for i in range(attempts):
         try:
@@ -3648,7 +3648,7 @@ async def _bot_config_upsert(feature, config):
         async with _http() as client:
             r = await client.post(
                 url,
-                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                headers={"x-worker-token": WORKER_TOKEN, "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
                          "Content-Type": "application/json",
                          "Prefer": "resolution=merge-duplicates,return=minimal"},
                 json=payload, timeout=15)
@@ -4870,7 +4870,7 @@ async def _platform_setting_get(key):
         return {}
     try:
         url = f"{SUPABASE_URL}/rest/v1/platform_settings?key=eq.{key}&select=value"
-        headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+        headers = {"x-worker-token": WORKER_TOKEN, "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
         async with _http() as client:
             r = await client.get(url, headers=headers, timeout=15)
         if r.status_code == 200:
@@ -10730,7 +10730,7 @@ async def poll_roblox_apply():
         async with _http() as client:
             r = await client.get(
                 url,
-                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+                headers={"x-worker-token": WORKER_TOKEN, "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
                 timeout=20,
             )
         if r.status_code != 200:
@@ -10922,7 +10922,7 @@ async def fire_online_status():
         async with _http() as client:
             await client.patch(
                 f"{SUPABASE_URL}/rest/v1/bot_runtime_status?bot_id=eq.{BOT_ORDER_ID}",
-                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "return=minimal"},
+                headers={"x-worker-token": WORKER_TOKEN, "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "return=minimal"},
                 json=payload, timeout=5,
             )
         print("[Boot] online status fired")
@@ -11024,7 +11024,7 @@ async def supabase_rpc(op: str, payload: dict | None = None):
         async with _http() as client:
             r = await client.post(
                 f"{SUPABASE_URL}/rest/v1/rpc/runtime_music_op",
-                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                headers={"x-worker-token": WORKER_TOKEN, "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
                          "Content-Type": "application/json"},
                 json={"p_token": WORKER_TOKEN, "p_op": op, "p_payload": payload or {}},
                 timeout=10)
@@ -14523,7 +14523,7 @@ async def apply_bot_identity():
         async with _http() as client:
             r = await client.get(
                 f"{SUPABASE_URL}/rest/v1/bot_orders?id=eq.{BOT_ORDER_ID}&select=bot_name",
-                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=10,
+                headers={"x-worker-token": WORKER_TOKEN, "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=10,
             )
             data = r.json()
             if not data or not isinstance(data, list) or not data[0].get("bot_name"):
@@ -14565,7 +14565,7 @@ async def apply_about_me():
         async with _http() as client:
             r = await client.get(
                 f"{SUPABASE_URL}/rest/v1/bot_orders?id=eq.{BOT_ORDER_ID}&select=bot_bio",
-                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=10,
+                headers={"x-worker-token": WORKER_TOKEN, "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=10,
             )
             status = r.status_code
             data = r.json()
@@ -14673,7 +14673,7 @@ async def _shutdown():
             async with _http() as client:
                 await client.patch(
                     f"{SUPABASE_URL}/rest/v1/bot_runtime_status?bot_id=eq.{BOT_ORDER_ID}",
-                    headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "return=minimal"},
+                    headers={"x-worker-token": WORKER_TOKEN, "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "return=minimal"},
                     json={"status": "offline"}, timeout=5,
                 )
         except Exception:
@@ -14709,7 +14709,7 @@ async def claim_shutdown_command():
             f"&status=eq.pending&created_at=gte.{BOT_START_TIME}&order=created_at.desc&select=id&limit=1"
         )
         async with _http() as client:
-            r = await client.get(url, headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=15)
+            r = await client.get(url, headers={"x-worker-token": WORKER_TOKEN, "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=15)
             data = r.json()
             if data and isinstance(data, list):
                 return data[0]
