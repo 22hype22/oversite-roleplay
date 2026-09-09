@@ -4069,6 +4069,8 @@ async def _select_jump(interaction, value):
 
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
+    if interaction.type in (discord.InteractionType.application_command, discord.InteractionType.component, discord.InteractionType.modal_submit):
+        _count_usage("commands")
     # Form submits arrive as modal_submit interactions (not component). Handle
     # ours here; leave every other modal (Close Order, etc.) to discord.py's own
     # Modal dispatch by returning. This fires regardless of restarts, so forms
@@ -7876,6 +7878,9 @@ def _econ_parse_amount(tok, ceiling):
 
 @bot.event
 async def on_message(message):
+    if message.author.id == getattr(bot.user, "id", None):
+        _count_usage("messages")
+        return
     # Economy / gambling prefix commands.
     if (gambling_config.get("enabled") and message.guild and not message.author.bot
             and message.content.startswith(gambling_config.get("prefix") or "!")):
@@ -7887,6 +7892,7 @@ async def on_message(message):
             try:
                 parts = message.content[len(gambling_config["prefix"]):].strip().split()
                 if parts:
+                    _count_usage("commands")
                     await _econ_dispatch(message, parts[0].lower(), parts[1:])
             except Exception as e:
                 print(f"[Econ] command error: {e}")
@@ -7967,6 +7973,7 @@ async def on_command_error(ctx, error):
     # so a plain "command not found" is expected noise — swallow just that.
     if isinstance(error, commands.CommandNotFound):
         return
+    _count_usage("errors")
     print(f"[Command] error: {error}")
 
 
@@ -10963,21 +10970,46 @@ async def before_heartbeat():
     await bot.wait_until_ready()
 
 
+# Usage counters for the dashboard's Fleet activity chart. Slash commands,
+# buttons, forms and prefix commands count as commands; messages the bot
+# itself sends count as messages. Flushed every five minutes.
+_usage = {"commands": 0, "messages": 0, "errors": 0}
+
+
+def _count_usage(kind, n=1):
+    try:
+        _usage[kind] = _usage.get(kind, 0) + n
+    except Exception:
+        pass
+
+
 @tasks.loop(minutes=5)
 async def record_metrics_loop():
     if not (BOT_ORDER_ID and WORKER_TOKEN):
         return
+    snapshot = dict(_usage)
+    for k in _usage:
+        _usage[k] = 0
     try:
         session = await get_poll_session()
-        await session.post(
+        async with session.post(
             f"{SUPABASE_FN_URL}/{BOT_API}/record-metrics",
             headers=_fn_headers(),
             json={
-                "bot_id": BOT_ORDER_ID, "commands": 0, "messages": 0, "errors": 0,
+                "bot_id": BOT_ORDER_ID,
+                "commands": int(snapshot.get("commands", 0)),
+                "messages": int(snapshot.get("messages", 0)),
+                "errors": int(snapshot.get("errors", 0)),
                 "active_servers": len(bot.guilds), "member_count": sum(g.member_count or 0 for g in bot.guilds),
             },
-        )
+        ) as r:
+            if r.status != 200:
+                # Put the counts back so the next flush carries them.
+                for k, v in snapshot.items():
+                    _usage[k] = _usage.get(k, 0) + v
     except Exception as e:
+        for k, v in snapshot.items():
+            _usage[k] = _usage.get(k, 0) + v
         print(f"[Metrics] error: {e}")
 
 
