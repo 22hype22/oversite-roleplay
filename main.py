@@ -13429,6 +13429,8 @@ class NativePlayer(discord.VoiceClient):
         self._prefetching = set()
         self._prefetch_task = None
         self._prefetch_wanted = False
+        # One track starts at a time. See play().
+        self._play_lock = asyncio.Lock()
         # Anything that lands in the queue starts downloading straight away,
         # so by the time the current song ends the next one is already on disk.
         self.queue = NativeQueue(on_change=self.prefetch_soon)
@@ -13456,8 +13458,19 @@ class NativePlayer(discord.VoiceClient):
         return max(0, int((now - self._started - self._pause_total) * 1000))
 
     async def play(self, track, **_kw):
+        """Start a track, one at a time.
+
+        Resolving and downloading take seconds. A second start slipping in
+        during that window used to reach the low-level play with audio already
+        running, which raised, and because `current` was already set and no
+        after-callback ever fired, the queue stopped advancing: the song you
+        skipped was the last one you heard."""
         if track is None:
             return
+        async with self._play_lock:
+            await self._start(track, **_kw)
+
+    async def _start(self, track, **_kw):
         start_ms = int(_kw.get("start") or 0)
         self._gen += 1
         gen = self._gen
@@ -13529,7 +13542,22 @@ class NativePlayer(discord.VoiceClient):
             except Exception:
                 pass
 
-        discord.VoiceClient.play(self, src, after=_after)
+        # Anything still on the air after the download has to go first, or the
+        # call below raises and nothing plays at all.
+        if self.is_playing() or self.is_paused():
+            try:
+                discord.VoiceClient.stop(self)
+            except Exception:
+                pass
+        try:
+            discord.VoiceClient.play(self, src, after=_after)
+        except Exception as e:
+            # Never leave the player holding a track it never started: without
+            # an end event the queue would sit there forever.
+            print(f"[Music] could not start '{str(track.title)[:50]}': {e}")
+            self.current = None
+            bot.dispatch("wavelink_track_end", _NativePayload(self, track, "loadFailed"))
+            return
         bot.dispatch("wavelink_track_start", _NativePayload(self, track))
         self.prefetch_soon()
 
