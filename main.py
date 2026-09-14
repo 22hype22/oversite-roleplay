@@ -13586,6 +13586,12 @@ class NativePlayer(discord.VoiceClient):
             self.current = None
             bot.dispatch("wavelink_track_end", _NativePayload(self, track, "loadFailed"))
             return
+        if gen != self._gen:
+            # A skip landed while this track was downloading. It is no longer
+            # the one to play, and whoever skipped has already moved the queue
+            # on, so drop it silently rather than talking over the new track.
+            print(f"[Music] dropped '{str(track.title)[:40]}': skipped while it was loading")
+            return
         self.current = track
         # Position clock accounts for a resumed start offset.
         self._started = time.monotonic() - (start_ms / 1000.0)
@@ -13672,12 +13678,26 @@ class NativePlayer(discord.VoiceClient):
                 self._prefetching.discard(key)
 
     async def skip(self, force=True):
-        # Stopping fires the after-callback -> track_end("finished") -> the
-        # existing end handler advances the queue.
-        try:
-            discord.VoiceClient.stop(self)
-        except Exception:
-            pass
+        """Move to the next track.
+
+        The easy case is audio on the air: stopping it fires the
+        after-callback, which raises track_end, and the end handler advances
+        the queue. But a skip often lands while the next track is still
+        downloading, or in the gap between two tracks, and then there is
+        nothing to stop. That call did nothing, no end event was raised, and
+        the skip vanished — the track being fetched would start a moment later
+        as though nobody had pressed anything. So when the air is quiet the
+        queue is advanced here instead."""
+        if self.is_playing() or self.is_paused():
+            try:
+                discord.VoiceClient.stop(self)
+                return
+            except Exception:
+                pass
+        # Nothing playing: retire whatever is starting and move on ourselves.
+        self._gen += 1
+        old, self.current = self.current, None
+        bot.dispatch("wavelink_track_end", _NativePayload(self, old, "finished"))
 
     async def pause(self, state):
         if state and self.is_playing():
