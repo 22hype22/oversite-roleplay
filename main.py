@@ -11606,6 +11606,10 @@ _np_artwork = {}
 _progress_tasks = {}
 _np_swept_channels = set()
 _resume_card_pos = {}
+# Guilds whose first card after a resume must render paused. The pause is
+# applied to the player a moment after the track starts, and the card can be
+# built in that gap, so the intent is recorded rather than inferred.
+_resume_card_paused = set()
 # Resume-after-redeploy: snapshot live playback to bot_config every few seconds
 # and restore it when the node comes back, so a redeploy rejoins, re-posts the
 # card, and picks up mid-song. _music_state_ready gates persistence so the empty
@@ -11837,8 +11841,18 @@ def _build_npv2_container(track, artwork, position_ms, with_image: bool = False)
     }
 
 
+def _guild_paused(guild_id):
+    """Whether this guild's player is paused right now."""
+    try:
+        guild = bot.get_guild(int(guild_id))
+        vc = guild.voice_client if guild else None
+        return bool(vc and getattr(vc, "paused", False))
+    except Exception:
+        return False
+
+
 class NowPlayingView(discord.ui.View):
-    def __init__(self, guild_id):
+    def __init__(self, guild_id, paused=None):
         super().__init__(timeout=None)
         self.guild_id = guild_id
         # Swap the unicode placeholders for this app's real emojis (resolved by
@@ -11846,7 +11860,13 @@ class NowPlayingView(discord.ui.View):
         try:
             self.like.emoji = EMOJI_HEART
             self.back.emoji = EMOJI_BACK
-            self.pause.emoji = EMOJI_PAUSE
+            # Whether this button reads "play" or "pause" is the state of the
+            # player, not a fixed default. Every card built from scratch showed
+            # "pause" over music that was paused, so after a redeploy a paused
+            # player looked like it had started itself up again.
+            if paused is None:
+                paused = _guild_paused(guild_id)
+            self.pause.emoji = EMOJI_PLAY if paused else EMOJI_PAUSE
             self.skip.emoji = EMOJI_SKIP
             self.dj_toggle.emoji = EMOJI_DJ_OFF
         except Exception:
@@ -12168,6 +12188,8 @@ async def send_now_playing(guild, track, channel):
             artwork = f"https://img.youtube.com/vi/{track.identifier}/maxresdefault.jpg"
 
         _pos0 = _resume_card_pos.pop(guild.id, None)
+        _paused0 = True if guild.id in _resume_card_paused else None
+        _resume_card_paused.discard(guild.id)
         if _pos0 is None:
             _pos0 = 0
             try:
@@ -12213,9 +12235,9 @@ async def send_now_playing(guild, track, channel):
             return
 
         if _buf0:
-            msg = await channel.send(embed=embed, view=NowPlayingView(guild.id), file=discord.File(_buf0, "progress.png"))
+            msg = await channel.send(embed=embed, view=NowPlayingView(guild.id, _paused0), file=discord.File(_buf0, "progress.png"))
         else:
-            msg = await channel.send(embed=embed, view=NowPlayingView(guild.id))
+            msg = await channel.send(embed=embed, view=NowPlayingView(guild.id, _paused0))
         now_playing_messages[guild.id] = msg
         _np_artwork[guild.id] = artwork
         _progress_tasks[guild.id] = asyncio.create_task(_progress_updater(guild.id))
@@ -13858,12 +13880,26 @@ async def _resume_one_guild(gid, st):
                 await vc.queue.put_wait(qt)
             except Exception:
                 pass
+    if st.get("paused"):
+        _resume_card_paused.add(gid)
     await vc.play(track, start=int(st.get("position_ms") or 0))
     if st.get("paused"):
-        try:
-            await vc.pause(True)
-        except Exception:
-            pass
+        # pause() only takes while the player is actually on the air, and the
+        # first frames may not have gone out the instant play() returns, which
+        # left the music running after a redeploy that paused it. Re-asserted
+        # until it holds rather than assumed.
+        for wait in (0, 0.3, 0.8, 1.5):
+            if wait:
+                await asyncio.sleep(wait)
+            try:
+                await vc.pause(True)
+            except Exception:
+                pass
+            if getattr(vc, "paused", False):
+                break
+        else:
+            print(f"[Music] resume: could not re-pause guild {gid}")
+        _resume_card_paused.discard(gid)
     print(f"[Music] resumed '{st.get('track_title','?')}' in guild {gid} @ {st.get('position_ms')}ms")
 
 
