@@ -13301,23 +13301,38 @@ async def _ytdlp_search_flat(target):
 
 
 class NativeQueue:
-    def __init__(self):
+    def __init__(self, on_change=None):
         self._items = []
+        # The player hands in a callback so ANY route into the queue starts the
+        # download, not just the handful that remembered to ask for it.
+        self._on_change = on_change
+
+    def _changed(self):
+        if self._on_change:
+            try:
+                self._on_change()
+            except Exception:
+                pass
 
     async def put_wait(self, item):
         self._items.append(item)
+        self._changed()
 
     def put(self, item):
         self._items.append(item)
+        self._changed()
 
     def get(self):
-        return self._items.pop(0)
+        item = self._items.pop(0)
+        self._changed()
+        return item
 
     def clear(self):
         self._items.clear()
 
     def shuffle(self):
         random.shuffle(self._items)
+        self._changed()
 
     def __len__(self):
         return len(self._items)
@@ -13339,6 +13354,11 @@ class _NativePayload:
 
 
 _FFMPEG_BEFORE_STREAM = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
+
+# How many queued tracks are kept downloaded and ready behind the one playing.
+# Two covers the common case (a short song followed by a long one) without
+# pulling down a whole 50-track playlist nobody has got to yet.
+MUSIC_PREFETCH = max(1, int(os.environ.get("MUSIC_PREFETCH", "2") or 2))
 
 _MUSIC_TMP_DIR = os.path.join(tempfile.gettempdir(), "oversite_music")
 _MUSIC_MAX_BYTES = 80 * 1024 * 1024  # refuse absurdly large downloads
@@ -13404,7 +13424,14 @@ class NativePlayer(discord.VoiceClient):
 
     def __init__(self, client, channel):
         super().__init__(client, channel)
-        self.queue = NativeQueue()
+        # Prefetch state first: the queue's callback reads it, and a track can
+        # land in the queue before __init__ has finished.
+        self._prefetching = set()
+        self._prefetch_task = None
+        self._prefetch_wanted = False
+        # Anything that lands in the queue starts downloading straight away,
+        # so by the time the current song ends the next one is already on disk.
+        self.queue = NativeQueue(on_change=self.prefetch_soon)
         self.current = None
         self.volume = int(music_config.get("volume") or 100)
         self._gen = 0
@@ -13504,21 +13531,49 @@ class NativePlayer(discord.VoiceClient):
 
         discord.VoiceClient.play(self, src, after=_after)
         bot.dispatch("wavelink_track_start", _NativePayload(self, track))
-        asyncio.create_task(self._prefetch_next())
+        self.prefetch_soon()
 
-    async def _prefetch_next(self):
-        """Resolve + download the next queued track while this one plays, so
-        skipping starts the next song immediately."""
+    def prefetch_soon(self):
+        """Something changed the queue. Get the next few tracks onto disk.
+
+        Runs one worker at a time and re-checks when it finishes, so queueing a
+        fifty-track playlist starts one download chain rather than fifty."""
+        self._prefetch_wanted = True
+        task = getattr(self, "_prefetch_task", None)
+        if task is not None and not task.done():
+            return
         try:
-            nxt = next(iter(self.queue), None)
-            if nxt is None or nxt.is_stream or nxt.local_path:
-                return
-            if not nxt.stream_url:
-                await _resolve_stream(nxt)
-            if nxt.stream_url and "m3u8" not in (nxt.protocol or "") and "hls" not in (nxt.protocol or ""):
-                nxt.local_path = await _music_download(nxt)
-        except Exception as e:
-            print(f"[Music] prefetch failed: {e}")
+            self._prefetch_task = asyncio.create_task(self._prefetch_loop())
+        except RuntimeError:
+            pass   # no running loop yet (player still being built)
+
+    async def _prefetch_loop(self):
+        while self._prefetch_wanted:
+            self._prefetch_wanted = False
+            await self._prefetch_window()
+
+    async def _prefetch_window(self):
+        """Download the next few queued tracks while this one plays, so a song
+        ends and the next one starts in the same breath."""
+        for nxt in list(self.queue)[:MUSIC_PREFETCH]:
+            key = id(nxt)
+            if key in self._prefetching:
+                continue   # already coming down; never fetch the same track twice
+            if nxt.is_stream or (nxt.local_path and os.path.exists(nxt.local_path)):
+                continue
+            self._prefetching.add(key)
+            try:
+                if not nxt.stream_url:
+                    await _resolve_stream(nxt)
+                proto = nxt.protocol or ""
+                if nxt.stream_url and "m3u8" not in proto and "hls" not in proto:
+                    nxt.local_path = await _music_download(nxt)
+                    if nxt.local_path:
+                        print(f"[Music] ready ahead of time: {str(nxt.title)[:50]}")
+            except Exception as e:
+                print(f"[Music] prefetch failed: {e}")
+            finally:
+                self._prefetching.discard(key)
 
     async def skip(self, force=True):
         # Stopping fires the after-callback -> track_end("finished") -> the
