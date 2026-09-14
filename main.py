@@ -13116,28 +13116,65 @@ _YTDLP_BASE = {
     "extractor_args": {"youtube": {"player_client": ["android", "web", "tv"]}},
 }
 
-# Optional: YouTube cookies dodge the datacenter bot-check for good. Set
-# YTDLP_COOKIES_B64 (base64 of a Netscape cookies.txt export) on the host.
+# YouTube bot-checks datacenter hosts, and cookies are the fix it actually
+# respects. Either env var works:
+#   YOUTUBE_COOKIES      a Netscape cookies.txt pasted in as-is
+#   YTDLP_COOKIES_B64    the same file, base64 encoded
+# Written to a temp file on every boot so a rotated cookie takes effect on the
+# next deploy rather than being shadowed by a stale copy. The contents are a
+# live credential and are never logged.
 def _ytdlp_cookiefile():
-    b64 = os.getenv("YTDLP_COOKIES_B64", "")
-    if not b64:
-        return None
-    path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-    if not os.path.exists(path):
+    raw = os.getenv("YOUTUBE_COOKIES", "").strip()
+    b64 = os.getenv("YTDLP_COOKIES_B64", "").strip()
+    data, src = b"", ""
+    if raw:
+        # Accept a pasted cookies.txt, and tolerate one that arrived base64'd
+        # in the plain variable anyway.
+        if raw.startswith("#") or "\t" in raw:
+            data, src = raw.encode(), "YOUTUBE_COOKIES"
+        else:
+            try:
+                import base64
+                data, src = base64.b64decode(raw), "YOUTUBE_COOKIES (base64)"
+            except Exception:
+                data, src = raw.encode(), "YOUTUBE_COOKIES"
+    elif b64:
         try:
             import base64
-            with open(path, "wb") as f:
-                f.write(base64.b64decode(b64))
+            data, src = base64.b64decode(b64), "YTDLP_COOKIES_B64"
         except Exception as e:
             print(f"[Music] cookie decode failed: {e}")
             return None
+    if not data:
+        return None
+    # A cookies.txt Netscape header is required or yt-dlp rejects the file.
+    if not data.lstrip().startswith(b"#"):
+        data = b"# Netscape HTTP Cookie File\n" + data
+    path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+    try:
+        with open(path, "wb") as f:
+            f.write(data)
+        os.chmod(path, 0o600)
+    except Exception as e:
+        print(f"[Music] could not write the cookie file: {e}")
+        return None
+    print(f"[Music] YouTube cookies loaded from {src} ({len(data)} bytes)")
     return path
 
 
 _ck = _ytdlp_cookiefile()
 if _ck:
     _YTDLP_BASE["cookiefile"] = _ck
-    print("[Music] YouTube cookies loaded")
+else:
+    print("[Music] no YouTube cookies set — datacenter bot-checks will block some tracks")
+
+# An outbound proxy, when one is configured, so extraction does not come from
+# a datacenter address YouTube already distrusts.
+YTDLP_PROXY = os.getenv("YTDLP_PROXY", "").strip()
+if YTDLP_PROXY:
+    _YTDLP_BASE["proxy"] = YTDLP_PROXY
+    _scheme = YTDLP_PROXY.split("://", 1)[0] if "://" in YTDLP_PROXY else "?"
+    print(f"[Music] extraction proxy: on ({_scheme})")
 
 
 def _clean_song_query(title, author=""):
@@ -13847,7 +13884,8 @@ async def musicdebug_cmd(interaction: discord.Interaction):
         f"**YouTube search:** {len(yt) if yt else 0} result(s)",
         f"**YouTube streams:** {'working' if yt_stream else 'BLOCKED (bot-check) — SoundCloud fallback in use'}",
         f"**SoundCloud search:** {len(sc) if sc else 0} result(s)",
-        f"**YouTube cookies:** {'loaded' if _YTDLP_BASE.get('cookiefile') else 'not set (YTDLP_COOKIES_B64)'}",
+        f"**YouTube cookies:** {'loaded' if _YTDLP_BASE.get('cookiefile') else 'not set (YOUTUBE_COOKIES or YTDLP_COOKIES_B64)'}",
+        f"**Extraction proxy:** {'on' if _YTDLP_BASE.get('proxy') else 'off (YTDLP_PROXY)'}",
     ]
     await interaction.followup.send(embed=info_embed("Music Diagnostics", "\n".join(lines)), ephemeral=True)
 
