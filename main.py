@@ -13237,11 +13237,42 @@ def _nt_from_info(info):
     return t
 
 
+def url_video_id(target):
+    """The single video a URL names, or "" if it names a playlist or nothing.
+
+    A watch link usually carries a list id too: YouTube appends &list=RD... the
+    moment you copy a link while a mix is playing. Following that list is how
+    pasting a link used to come back as a different song entirely, so a URL
+    that names a video is treated as naming exactly that video."""
+    try:
+        from urllib.parse import urlparse, parse_qs
+        u = urlparse(target)
+    except Exception:
+        return ""
+    host = (u.netloc or "").lower()
+    if "youtu.be" in host:
+        return u.path.strip("/").split("/")[0]
+    if "youtube" in host:
+        v = parse_qs(u.query or "").get("v")
+        if v and v[0]:
+            return v[0]
+        for seg in ("/shorts/", "/live/", "/embed/", "/v/"):
+            if seg in u.path:
+                return u.path.split(seg, 1)[1].split("/")[0]
+    return ""
+
+
 def _ytdlp_extract_sync(target, playlist_limit=25):
     opts = dict(_YTDLP_BASE)
-    if ":" not in target.split("//", 1)[0] or target.startswith(("http://", "https://")):
-        opts["noplaylist"] = False
-        opts["playlistend"] = playlist_limit
+    is_url = target.startswith(("http://", "https://"))
+    if is_url or ":" not in target.split("//", 1)[0]:
+        if is_url and url_video_id(target):
+            # The link names a video, so play that video and ignore any mix or
+            # playlist id hanging off the end of it.
+            opts["noplaylist"] = True
+        else:
+            opts["noplaylist"] = False
+            opts["playlistend"] = playlist_limit
     with _ytdlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(target, download=False)
     if isinstance(info, dict) and info.get("_type") == "playlist":
@@ -14051,6 +14082,41 @@ async def music_play(interaction: discord.Interaction, query: str):
         return
     if isinstance(tracks, wavelink.Playlist):
         tracks = tracks.tracks
+    # A pasted link already names what to play. The version-picking below scores
+    # results against the query, and a URL is one long token that matches no
+    # title, so it used to choose more or less at random among whatever came
+    # back. Take the link at its word instead.
+    if _used_src == "direct" and len(tracks) == 1:
+        track = tracks[0]
+        _adjust_taste(interaction.guild.id, getattr(track, "author", None), 3.0)
+        was_playing = vc.playing
+        await vc.queue.put_wait(track)
+        if not was_playing:
+            await vc.play(vc.queue.get())
+            await interaction.followup.send(embed=success_embed("Playing", f"**{track.title}**"))
+        elif _was_dj:
+            await vc.skip(force=True)
+            await interaction.followup.send(embed=success_embed("Playing", f"**{track.title}**"))
+        else:
+            await interaction.followup.send(embed=success_embed("Added to queue", f"**{track.title}**"))
+        return
+    if _used_src == "direct" and len(tracks) > 1:
+        # An actual playlist link. Queue the lot, in order, rather than picking
+        # one of them and dropping the rest.
+        first = tracks[0]
+        was_playing = vc.playing
+        for t in tracks:
+            try:
+                await vc.queue.put_wait(t)
+            except Exception:
+                pass
+        if not was_playing and vc.queue:
+            await vc.play(vc.queue.get())
+        elif _was_dj and vc.playing:
+            await vc.skip(force=True)
+        await interaction.followup.send(embed=success_embed(
+            "Playlist queued", f"Added **{len(tracks)}** tracks, starting with **{first.title}**."))
+        return
     # Pick the version people actually play: filter to results that MATCH the
     # query as well as the best textual match (keeps the real artist, drops
     # rips/covers), then take the most played among them.
