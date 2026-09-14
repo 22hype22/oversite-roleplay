@@ -14983,6 +14983,7 @@ async def before_poll_shutdown():
 INFO_NAME = "Oversite Roleplay"
 INFO_WHAT = ("Community management for a roleplay server. Tickets, infractions, "
              "promotions, giveaways, invites, ads and music.")
+INFO_MAKER = "22HYPE22 @Oversite"
 INFO_SITE = "https://www.oversite.shop"
 INFO_SUPPORT = "https://discord.gg/ovs"
 INFO_COLOR = 0x3B82F6
@@ -14997,7 +14998,11 @@ def info_version():
 
 def info_embed(me=None):
     embed = discord.Embed(title=INFO_NAME, description=INFO_WHAT, color=INFO_COLOR)
-    embed.add_field(name="Made by", value="Oversite" + chr(10) + INFO_SITE, inline=True)
+    # Concatenated rather than an f-string: the newline would be a backslash
+    # inside one, which the Python one of these bots runs on rejects.
+    embed.add_field(name="Made by",
+                    value=INFO_MAKER + chr(10) + "[oversite.shop](" + INFO_SITE + ")",
+                    inline=True)
     embed.add_field(name="Support", value=INFO_SUPPORT, inline=True)
     version = info_version()
     if version:
