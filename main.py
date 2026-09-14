@@ -14972,55 +14972,6 @@ async def before_poll_shutdown():
     await bot.wait_until_ready()
 
 
-# ------------------------------------------------------------------ /info
-#
-# Who made this bot, what it is, and where to get one. Every Oversite bot
-# answers /info with the same card, so somebody who meets one in any server
-# sees the same thing and knows where it came from.
-#
-# The version is read from the commit Railway built, rather than a constant
-# somebody has to remember to bump, so it is never quietly wrong.
-INFO_NAME = "Oversite Roleplay"
-INFO_WHAT = ("Community management for a roleplay server. Tickets, infractions, "
-             "promotions, giveaways, invites, ads and music.")
-INFO_SITE = "https://www.oversite.shop"
-INFO_SUPPORT = "https://discord.gg/ovs"
-INFO_COLOR = 0x3B82F6
-_info_started = int(time.time())
-
-
-def info_version():
-    """What is actually running, or "" when there is nothing trustworthy."""
-    sha = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "").strip()
-    return sha[:7]
-
-
-def info_embed(me=None):
-    embed = discord.Embed(title=INFO_NAME, description=INFO_WHAT, color=INFO_COLOR)
-    embed.add_field(name="Made by", value="Oversite" + chr(10) + INFO_SITE, inline=True)
-    embed.add_field(name="Support", value=INFO_SUPPORT, inline=True)
-    version = info_version()
-    if version:
-        embed.add_field(name="Version", value=f"`{version}`", inline=True)
-    embed.add_field(name="Online since", value=f"<t:{_info_started}:R>", inline=True)
-    if me is not None:
-        try:
-            embed.set_thumbnail(url=me.display_avatar.url)
-        except Exception:
-            pass
-    embed.set_footer(text="Built and hosted by Oversite")
-    return embed
-
-
-@bot.tree.command(name="info", description="Who made this bot and where it came from")
-async def info_command(interaction):
-    try:
-        await interaction.response.send_message(
-            embed=info_embed(getattr(interaction.client, "user", None)))
-    except Exception as exc:
-        print(f"/info failed: {exc}", flush=True)
-
-
 def _run():
     # uvloop: drop-in libuv event loop, measurably faster for IO-heavy bots.
     # Guarded — if it's ever missing or broken we run on stock asyncio.
