@@ -5737,20 +5737,87 @@ async def _v2_respond(interaction, comps, rows=None, note=None, update=False, ep
     await bot.http.request(route, json={"type": 7 if update else 4, "data": data})
 
 
-def _session_menu_row():
-    return {"type": 1, "components": [{"type": 3, "custom_id": "session_action", "placeholder": "What do you want to do?",
-                                       "options": [{"label": lbl, "value": v, "description": desc} for v, lbl, desc in SESSION_ACTIONS]}]}
+def _session_menu_row(spec=None):
+    """The action menu. Each option is bound to its action by position, so the
+    owner's wording from the design (spec) is used where they gave it and the
+    built-in wording fills in the rest."""
+    opts = (spec or {}).get("options") if isinstance(spec, dict) else None
+    opts = opts if isinstance(opts, list) else []
+    options = []
+    for i, (v, lbl, desc) in enumerate(SESSION_ACTIONS):
+        own = opts[i] if i < len(opts) and isinstance(opts[i], dict) else {}
+        o = {"label": (str(own.get("label") or "").strip() or lbl)[:100], "value": v}
+        d = str(own.get("description") or "").strip() if own else desc
+        if d:
+            o["description"] = d[:100]
+        options.append(o)
+    placeholder = (str((spec or {}).get("placeholder") or "").strip() if isinstance(spec, dict) else "") or "What do you want to do?"
+    return {"type": 1, "components": [{"type": 3, "custom_id": "session_action", "placeholder": placeholder[:150],
+                                       "options": options}]}
+
+
+def _session_place_fixed(design, vote=None, disabled=False):
+    """Render the parts the bot owns wherever the owner put them in a design.
+
+    The dashboard keeps the action menu and the Vote button inside the design
+    so they can be worded, coloured and placed. Here each one is swapped for
+    the real component: the menu for the bound menu, the Vote button for the
+    live one. Returns the design and whether each part was found, so a design
+    from before this (with neither) still gets them appended underneath."""
+    found = {"menu": False, "vote": False}
+
+    def _walk(items):
+        out = []
+        for c in items or []:
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") in ("select_menu", "select") and c.get("__session_menu"):
+                found["menu"] = True
+                out.append({"type": "raw", "component": _session_menu_row(c)})
+                continue
+            if c.get("type") == "buttonRow":
+                buttons = []
+                for b in c.get("buttons") or []:
+                    if isinstance(b, dict) and b.get("__session_vote"):
+                        found["vote"] = True
+                        if vote is not None:
+                            buttons.append({"__raw": _session_vote_button(vote, disabled, b)})
+                        continue
+                    buttons.append(b)
+                out.append({**c, "buttons": buttons} if buttons else None)
+                continue
+            if c.get("type") == "container":
+                out.append({**c, "children": _walk(c.get("children"))})
+                continue
+            out.append(c)
+        return [x for x in out if x]
+
+    return _walk(design), found
 
 
 async def _session_panel(interaction, note=None, update=False):
     design = _ui_render(_session_design("panel"), _session_mapping(interaction.guild, interaction.user))
-    await _v2_respond(interaction, design, rows=[_session_menu_row()], note=note, update=update)
+    design, found = _session_place_fixed(design)
+    await _v2_respond(interaction, design, rows=[] if found["menu"] else [_session_menu_row()], note=note, update=update)
 
 
-def _session_vote_button(vote, disabled=False):
+def _session_vote_button(vote, disabled=False, spec=None):
+    """The live Vote button. With a spec from the design, the owner's label
+    (already rendered, so {votes} and {needed} are numbers) and colour are
+    used while the vote is open; a passed vote always reads as passed."""
     n, needed = len(vote.get("voters") or []), int(vote.get("needed") or 0)
-    label = f"Vote, {n} of {needed}" if not vote.get("passed") else f"Vote passed, {n} of {needed}"
-    return {"type": 2, "style": 3 if vote.get("passed") else 1, "custom_id": "session_vote", "label": label[:80], "disabled": disabled}
+    if vote.get("passed"):
+        return {"type": 2, "style": 3, "custom_id": "session_vote", "label": f"Vote passed, {n} of {needed}"[:80], "disabled": disabled}
+    label = f"Vote, {n} of {needed}"
+    style = 1
+    if isinstance(spec, dict):
+        own = str(spec.get("label") or "").strip()
+        if own:
+            label = own
+        style = BUTTON_STYLE_MAP.get(str(spec.get("style") or "primary").lower(), 1)
+        if style == 5:
+            style = 1
+    return {"type": 2, "style": style, "custom_id": "session_vote", "label": label[:80], "disabled": disabled}
 
 
 async def _session_edit_vote(guild, disabled=False):
@@ -5762,8 +5829,10 @@ async def _session_edit_vote(guild, disabled=False):
     if not ch:
         return
     comps = _ui_render(_session_design("vote"), _session_mapping(guild, guild.get_member(int(vote["by"])) if str(vote.get("by")).isdigit() else None))
+    comps, found = _session_place_fixed(comps, vote, disabled)
     built = [b for b in (_build_v2(c, guild) for c in comps) if b]
-    built.append({"type": 1, "components": [_session_vote_button(vote, disabled)]})
+    if not found["vote"]:
+        built.append({"type": 1, "components": [_session_vote_button(vote, disabled)]})
     route = discord.http.Route("PATCH", "/channels/{channel_id}/messages/{message_id}", channel_id=ch.id, message_id=int(vote["message_id"]))
     try:
         await bot.http.request(route, json={"components": built, "flags": 1 << 15, "allowed_mentions": {"parse": []}})
@@ -5785,7 +5854,9 @@ async def _session_do(interaction, action):
         vote = {"message_id": "", "channel_id": str(ch.id), "voters": [], "needed": needed, "by": str(user.id), "passed": False}
         d["vote"] = vote
         comps = _ui_render(_session_design("vote"), _session_mapping(guild, user))
-        mid = await send_v2_message(ch, comps, buttons=[_session_vote_button(vote)], allowed_mentions=_session_allowed_mentions())
+        comps, found = _session_place_fixed(comps, vote)
+        mid = await send_v2_message(ch, comps, buttons=None if found["vote"] else [_session_vote_button(vote)],
+                                    allowed_mentions=_session_allowed_mentions())
         vote["message_id"] = str(mid) if isinstance(mid, str) else ""
         await _session_save()
         return f"Vote posted in {ch.mention}. It passes at {needed} votes."
@@ -8375,6 +8446,10 @@ def _build_v2(comp, guild):
     """Convert one dashboard V2 item into a raw Discord Components-V2 object.
     Module-level so both send_v2_message and the giveaway renderer can use it."""
     ctype = comp.get("type", "")
+    if ctype == "raw":
+        # A finished Discord component placed into a design by the code that
+        # owns it (the session action menu). Rendered exactly as given.
+        return dict(comp["component"]) if isinstance(comp.get("component"), dict) else None
     if ctype in ("text", "text_display"):
         text = comp.get("text") or comp.get("content", "")
         title = comp.get("title", "")
@@ -8654,7 +8729,23 @@ def _extract_button_emoji(label):
     return clean, emoji
 
 
+def _design_has_button(items, marker):
+    """Whether any button anywhere in a design carries the given marker."""
+    for c in items or []:
+        if not isinstance(c, dict):
+            continue
+        if c.get("type") == "buttonRow" and any(isinstance(b, dict) and b.get(marker) for b in c.get("buttons") or []):
+            return True
+        if c.get("type") == "container" and _design_has_button(c.get("children"), marker):
+            return True
+    return False
+
+
 def build_button(btn, guild):
+    # A button the bot already built, placed into a design by the code that
+    # owns it (the session vote button). Passed through untouched.
+    if isinstance(btn.get("__raw"), dict):
+        return dict(btn["__raw"])
     label = btn.get("label", "Button")
     category = btn.get("category", "")
     channel_id = btn.get("channel_id", "")
@@ -9317,9 +9408,14 @@ async def post_verify_panel():
     comps = roblox_config.get("components") or []
 
     def _with_button(source):
-        # Tuck the Verify button inside a container (with the text) so it doesn't
-        # dangle at the very bottom outside the box. Prefer the last container;
-        # if the design has none, add it as a top-level sibling row.
+        # The dashboard keeps the Verify button inside the design now, worded,
+        # coloured and placed by the owner, so a design that carries one is
+        # rendered as it is. An older design with none gets the button tucked
+        # inside a container (with the text) so it doesn't dangle at the very
+        # bottom outside the box: the last container, or a top-level row when
+        # the design has no container.
+        if _design_has_button(source, "__verify"):
+            return [dict(c) for c in source]
         panel = [dict(c) for c in source]
         container_idxs = [i for i, c in enumerate(panel) if c.get("type") == "container"]
         if container_idxs:
