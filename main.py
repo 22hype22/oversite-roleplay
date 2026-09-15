@@ -2314,6 +2314,7 @@ async def send_presence(presence, activity_type, text):
     try:
         await bot.change_presence(status=state, activity=activity)
         status_state["applied"] = want
+        print(f"[Status] showing {presence} — {activity_type}: {text!r}")
     except Exception as e:
         print(f"[Status] update failed: {e}")
 
@@ -2352,29 +2353,45 @@ async def refresh_status():
     await send_presence(status_state["presence"], line["activity_type"], line["text"])
 
 
+_status_load_said = None  # last load problem reported, so a repeat stays quiet
+
+
 async def load_status_config():
-    """Read the owner's status straight off the order, so a redeploy comes back
-    showing what they set rather than the fallback."""
-    if not (SUPABASE_URL and BOT_ORDER_ID):
+    """Read the owner's status off the order, so a redeploy comes back showing
+    what they set rather than the fallback.
+
+    This goes through the runtime_get_bot_presence function, the same read
+    every other bot uses. It used to select the columns straight off
+    bot_orders, and the bot's key only has column grants there for a handful
+    of fields: the read came back 401, the body was a dict rather than a
+    list, and that was silently taken as "nothing configured", so the owner's
+    status never showed. A read that fails now says so."""
+    global _status_load_said
+    if not (SUPABASE_URL and BOT_ORDER_ID and SUPABASE_KEY):
         return
     try:
         async with _http() as client:
-            r = await client.get(
-                f"{SUPABASE_URL}/rest/v1/bot_orders?id=eq.{BOT_ORDER_ID}"
-                "&select=presence_status,activity_type,activity_text,status_rotation,status_rotation_seconds",
-                headers={"x-worker-token": WORKER_TOKEN, "apikey": SUPABASE_KEY,
-                         "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=10,
+            r = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/runtime_get_bot_presence",
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                         "Content-Type": "application/json"},
+                json={"_bot_id": BOT_ORDER_ID}, timeout=10,
             )
-            data = r.json()
-        if isinstance(data, list) and data:
-            row = data[0]
-            set_status_config(
-                presence=row.get("presence_status"),
-                activity_type=row.get("activity_type"),
-                activity_text=row.get("activity_text"),
-                rotation=row.get("status_rotation"),
-                rotation_seconds=row.get("status_rotation_seconds"),
-            )
+            data = r.json() if r.status_code == 200 else None
+        if not isinstance(data, dict):
+            problem = f"HTTP {r.status_code} {str(r.text)[:160]}"
+            if problem != _status_load_said:
+                print(f"[Status] config read failed: {problem}")
+                _status_load_said = problem
+            return
+        _status_load_said = None
+        set_status_config(
+            presence=data.get("presence"),
+            activity_type=data.get("activity_type"),
+            activity_text=data.get("activity_text"),
+            rotation=data.get("rotation"),
+            rotation_seconds=data.get("rotation_seconds"),
+        )
     except Exception as e:
         print(f"[Status] config load failed: {e}")
 
