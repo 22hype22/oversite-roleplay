@@ -15453,6 +15453,69 @@ async def dmsay_command(
         embed=success_embed("Sent", f"{member.mention} has it."), ephemeral=True)
 
 
+# ── Boot resilience ──────────────────────────────────────────────────────────
+# A transient Discord failure at login or on the first gateway connection must
+# not take the process with it. discord.py raises straight out of run() in two
+# such cases: a 5xx from /users/@me at login, and a 503 from the gateway on the
+# very first connect, where its reconnect path reads self.ws.sequence before
+# self.ws exists. Railway then restarts the container, and after ten fast
+# crashes gives up — which is how a fifty-minute Discord incident left bots
+# dead for an hour after it had ended. Retry here instead: wait, escalating
+# from 5s to 60s, then re-exec so discord.py starts clean. Anything that is
+# not one of those two failures still raises, so a real bug is never hidden.
+_BOOT_RETRY_ENV = "OVERSITE_BOOT_RETRY"
+_BOOT_RETRY_AT_ENV = "OVERSITE_BOOT_RETRY_AT"
+
+
+def _transient_boot_failure(exc):
+    """True only for the two library failures described above."""
+    if isinstance(exc, AttributeError):
+        return "'NoneType' object has no attribute 'sequence'" in str(exc)
+    server_error = getattr(getattr(discord, "errors", None), "DiscordServerError", None)
+    if server_error is not None and isinstance(exc, server_error):
+        return True
+    status = getattr(exc, "status", None)
+    return isinstance(status, int) and 500 <= status <= 599
+
+
+def _boot_retry(exc):
+    """Wait with an escalating backoff, then re-exec this process."""
+    import sys as _sys
+    now = time.time()
+    try:
+        attempt = int(os.environ.get(_BOOT_RETRY_ENV, "0") or 0)
+        started = float(os.environ.get(_BOOT_RETRY_AT_ENV, "0") or 0)
+    except ValueError:
+        attempt, started = 0, 0.0
+    # A retry run that has been up for a while is a fresh problem, not the
+    # same one: start the backoff over rather than waiting a full minute.
+    if started and now - started > 600:
+        attempt = 0
+    wait = min(60, 5 * (2 ** attempt))
+    print(f"[Boot] Discord refused the connection ({exc.__class__.__name__}); "
+          f"retrying in {wait}s (attempt {attempt + 1})", flush=True)
+    time.sleep(wait)
+    env = dict(os.environ)
+    env[_BOOT_RETRY_ENV] = str(attempt + 1)
+    env[_BOOT_RETRY_AT_ENV] = str(started or now)
+    os.execve(_sys.executable, [_sys.executable] + _sys.argv, env)
+
+
+def _run_guarded():
+    try:
+        bot.run(TOKEN)
+    except Exception as e:
+        if isinstance(e, discord.errors.HTTPException) and getattr(e, "status", None) == 429:
+            import sys as _sys
+            # A login 429 is a Cloudflare IP ban; rapid restarts deepen it.
+            print("[Boot] Discord rate-limit ban — sleeping 15 minutes before retrying login", flush=True)
+            time.sleep(900)
+            os.execv(_sys.executable, [_sys.executable] + _sys.argv)
+        if _transient_boot_failure(e):
+            _boot_retry(e)
+        raise
+
+
 def _run():
     # uvloop: drop-in libuv event loop, measurably faster for IO-heavy bots.
     # Guarded — if it's ever missing or broken we run on stock asyncio.
@@ -15482,16 +15545,7 @@ def _run():
         print("[Boot] reconnect backoff capped at 60s")
     except Exception as _e:
         print(f"[Boot] backoff cap not applied: {_e}")
-    try:
-        bot.run(TOKEN)
-    except discord.errors.HTTPException as e:
-        if getattr(e, "status", None) == 429:
-            import time
-            import sys
-            print("[Boot] rate-limit ban — sleeping 15 minutes")
-            time.sleep(900)
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-        raise
+    _run_guarded()
 
 
 if __name__ == "__main__":
