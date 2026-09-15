@@ -5647,8 +5647,8 @@ SESSION_DEFAULTS = {
     "boost": _v2_text("## Session boost\n{ping} We need more players in the server right now. Come join."),
     "end": _v2_text("## Session ended\n{ping} The server has shut down. Thanks to everyone who joined.\nEnded by {user}."),
 }
-session_config = {"manager_role_ids": [], "channel_id": "", "ping_role_id": "", "vote_needed": 5,
-                  "designs": {k: [] for k in SESSION_DEFAULTS}}
+session_config = {"manager_role_ids": [], "staff_role_ids": [], "channel_id": "", "ping_role_id": "",
+                  "vote_needed": 5, "designs": {k: [] for k in SESSION_DEFAULTS}}
 session_data = {}   # guild_id -> {"active", "start_ts", "started_by", "vote": {"message_id","channel_id","voters","needed","by","passed"}}
 _session_loaded = False
 SESSION_ACTIONS = [
@@ -5713,6 +5713,199 @@ def _session_mapping(guild, user=None, **extra):
     }
     m.update(extra)
     return m
+
+
+# ── What the game server says about itself ───────────────────────────────────
+# A session message that says "the server is up" is more use when it says whose
+# server, how many are in it, how many are waiting to get in and how many staff
+# are on. Those come from the ER:LC API, which needs the server key the owner
+# saves under API keys and credentials.
+ERLC_BASE = "https://api.erlc.gg/v2"
+# One call answers all four tokens: the server, who is in it and who is queued.
+# The old per-thing routes (/server/players, /server/queue) are gone from this
+# API, and api.policeroleplay.community with them.
+ERLC_PATH = "/server?Players=true&Queue=true"
+# The API is rate limited per key. Every session message renders from one
+# snapshot, and a snapshot is reused for this long, so a burst of edits during
+# a vote costs one round of calls rather than one per edit.
+ERLC_CACHE = float(os.environ.get("ERLC_CACHE_SECONDS", "15"))
+ERLC_KEY_CACHE = float(os.environ.get("ERLC_KEY_CACHE_SECONDS", "300"))
+# What a token reads as when the server cannot be reached. Not a zero: zero
+# players is a fact, and a key that was never entered is not.
+GAME_UNKNOWN = "unknown"
+_erlc = {"key": "", "key_at": 0.0, "snap": None, "snap_at": 0.0, "said": "", "fetching": None}
+
+
+async def _erlc_key():
+    """The owner's ER:LC server key, re-read now and then so saving one takes
+    effect without a restart."""
+    now = time.time()
+    if _erlc["key"] and now - _erlc["key_at"] < ERLC_KEY_CACHE:
+        return _erlc["key"]
+    key = await _bot_secret("ERLC_SERVER_KEY")
+    _erlc["key"], _erlc["key_at"] = key or "", now
+    return _erlc["key"]
+
+
+def _erlc_say(msg):
+    """Say what is wrong once, not once per message rendered."""
+    if _erlc["said"] != msg:
+        _erlc["said"] = msg
+        print(f"[Session] {msg}")
+
+
+async def _erlc_get(client, key, path):
+    r = await client.get(f"{ERLC_BASE}{path}", headers={"Server-Key": key}, timeout=8)
+    if r.status_code == 200:
+        return r.json()
+    body = r.text[:160]
+    if r.status_code in (401, 403):
+        _erlc_say(f"ER:LC refused the server key ({r.status_code}). Check it under API keys and credentials.")
+    elif r.status_code == 429:
+        _erlc_say("ER:LC is rate limiting this key, so the game numbers are a moment behind.")
+    else:
+        _erlc_say(f"ER:LC {path} returned {r.status_code}: {body}")
+    return None
+
+
+async def _erlc_snapshot():
+    """The server, its players and its queue, in one cached read."""
+    now = time.time()
+    if _erlc["snap"] is not None and now - _erlc["snap_at"] < ERLC_CACHE:
+        return _erlc["snap"]
+    if _erlc["fetching"] is not None:
+        # Another message is already asking. Wait for that answer instead of
+        # spending a second round of calls on the same numbers.
+        try:
+            return await asyncio.shield(_erlc["fetching"])
+        except Exception:
+            return _erlc["snap"]
+    _erlc["fetching"] = asyncio.ensure_future(_erlc_fetch())
+    try:
+        return await _erlc["fetching"]
+    finally:
+        _erlc["fetching"] = None
+
+
+async def _erlc_fetch():
+    key = await _erlc_key()
+    if not key:
+        _erlc_say("the game tokens need an ER:LC server key saved under API keys and credentials.")
+        _erlc["snap"], _erlc["snap_at"] = None, time.time()
+        return None
+    try:
+        async with _http() as client:
+            server = await _erlc_get(client, key, ERLC_PATH)
+    except Exception as e:
+        _erlc_say(f"could not reach ER:LC: {e}")
+        _erlc["snap"], _erlc["snap_at"] = None, time.time()
+        return None
+    if not isinstance(server, dict):
+        _erlc["snap"], _erlc["snap_at"] = None, time.time()
+        return None
+    _erlc["said"] = ""
+    players = server.get("Players")
+    players = players if isinstance(players, list) else []
+    queue = server.get("Queue")
+    snap = {
+        "name": str(server.get("Name") or "").strip(),
+        # The player list is the truth about who is in. CurrentPlayers is the
+        # fallback for a reply that carried the count but not the list.
+        "count": len(players) if players else int(server.get("CurrentPlayers") or 0),
+        "max": int(server.get("MaxPlayers") or 0),
+        "queue": len(queue) if isinstance(queue, list) else 0,
+        "players": players,
+    }
+    _erlc["snap"], _erlc["snap_at"] = snap, time.time()
+    return snap
+
+
+def _norm_player(name):
+    return re.sub(r"[^a-z0-9_]", "", str(name or "").lower())
+
+
+def _ingame_names(players):
+    """Every Roblox username in the server right now. ER:LC gives these as
+    'Username:UserId'."""
+    out = set()
+    for p in players or []:
+        raw = str((p or {}).get("Player") or "").split(":")[0]
+        n = _norm_player(raw)
+        if n:
+            out.add(n)
+    return out
+
+
+def _member_name_guesses(member):
+    """The names this member might be playing under.
+
+    Verification renames people to their Roblox username, so the nickname is
+    usually it. A nickname decorated with a callsign or a rank in brackets
+    still carries the name, so the brackets are dropped and the words left
+    over are tried too."""
+    out = set()
+    for raw in (getattr(member, "nick", "") or "", getattr(member, "display_name", "") or "",
+                getattr(member, "name", "") or "", getattr(member, "global_name", "") or ""):
+        text = re.sub(r"[\[\(\{][^\]\)\}]*[\]\)\}]", " ", str(raw))
+        whole = _norm_player(text)
+        if whole:
+            out.add(whole)
+        for word in re.split(r"[^A-Za-z0-9_]+", text):
+            if len(word) >= 3:
+                out.add(_norm_player(word))
+    return {n for n in out if n}
+
+
+def _session_staff_roles():
+    """The roles that make somebody staff for the count. The owner can name
+    them on the Sessions block; without that the people who can manage
+    sessions are the staff."""
+    roles = [str(r) for r in (session_config.get("staff_role_ids") or []) if r]
+    return roles or [str(r) for r in (session_config.get("manager_role_ids") or []) if r]
+
+
+def _staff_in_game(guild, players):
+    """How many of the staff are in the server right now.
+
+    Strictly by role: an administrator without one of the staff roles is not
+    counted, or every admin would show up as on duty."""
+    roles = set(_session_staff_roles())
+    if not roles or guild is None:
+        return 0
+    playing = _ingame_names(players)
+    if not playing:
+        return 0
+    seen = 0
+    for member in getattr(guild, "members", []) or []:
+        if getattr(member, "bot", False):
+            continue
+        if not ({str(r.id) for r in getattr(member, "roles", [])} & roles):
+            continue
+        if _member_name_guesses(member) & playing:
+            seen += 1
+    return seen
+
+
+async def _session_game_tokens(guild):
+    """{gname} {gcount} {gqueue} {gstaffcount} for a session message."""
+    snap = await _erlc_snapshot()
+    if not snap:
+        return {"gname": GAME_UNKNOWN, "gcount": GAME_UNKNOWN,
+                "gqueue": GAME_UNKNOWN, "gstaffcount": GAME_UNKNOWN}
+    return {
+        "gname": snap["name"] or GAME_UNKNOWN,
+        "gcount": str(snap["count"]),
+        "gmax": str(snap["max"]),
+        "gqueue": str(snap["queue"]),
+        "gstaffcount": str(_staff_in_game(guild, snap["players"])),
+    }
+
+
+async def _session_map(guild, user=None, **extra):
+    """The session tokens, with the game's own numbers filled in."""
+    game = await _session_game_tokens(guild)
+    game.update(extra)
+    return _session_mapping(guild, user, **game)
 
 
 def _session_allowed_mentions():
@@ -5796,7 +5989,7 @@ def _session_place_fixed(design, vote=None, disabled=False):
 
 
 async def _session_panel(interaction, note=None, update=False):
-    design = _ui_render(_session_design("panel"), _session_mapping(interaction.guild, interaction.user))
+    design = _ui_render(_session_design("panel"), await _session_map(interaction.guild, interaction.user))
     design, found = _session_place_fixed(design)
     await _v2_respond(interaction, design, rows=[] if found["menu"] else [_session_menu_row()], note=note, update=update)
 
@@ -5828,7 +6021,7 @@ async def _session_edit_vote(guild, disabled=False):
     ch = guild.get_channel(int(vote["channel_id"])) if str(vote.get("channel_id")).isdigit() else None
     if not ch:
         return
-    comps = _ui_render(_session_design("vote"), _session_mapping(guild, guild.get_member(int(vote["by"])) if str(vote.get("by")).isdigit() else None))
+    comps = _ui_render(_session_design("vote"), await _session_map(guild, guild.get_member(int(vote["by"])) if str(vote.get("by")).isdigit() else None))
     comps, found = _session_place_fixed(comps, vote, disabled)
     built = [b for b in (_build_v2(c, guild) for c in comps) if b]
     if not found["vote"]:
@@ -5853,7 +6046,7 @@ async def _session_do(interaction, action):
         needed = max(1, int(session_config.get("vote_needed") or 5))
         vote = {"message_id": "", "channel_id": str(ch.id), "voters": [], "needed": needed, "by": str(user.id), "passed": False}
         d["vote"] = vote
-        comps = _ui_render(_session_design("vote"), _session_mapping(guild, user))
+        comps = _ui_render(_session_design("vote"), await _session_map(guild, user))
         comps, found = _session_place_fixed(comps, vote)
         mid = await send_v2_message(ch, comps, buttons=None if found["vote"] else [_session_vote_button(vote)],
                                     allowed_mentions=_session_allowed_mentions())
@@ -5866,14 +6059,14 @@ async def _session_do(interaction, action):
             d["vote"]["passed"] = True
             await _session_edit_vote(guild, disabled=True)
             d["vote"] = None
-        comps = _ui_render(_session_design("start"), _session_mapping(guild, user))
+        comps = _ui_render(_session_design("start"), await _session_map(guild, user))
         await send_v2_message(ch, comps, allowed_mentions=_session_allowed_mentions())
         await _session_save()
         return f"Session started, announced in {ch.mention}."
     if action == "boost":
         if not d.get("active"):
             return "There's no session running. Start one first."
-        comps = _ui_render(_session_design("boost"), _session_mapping(guild, user))
+        comps = _ui_render(_session_design("boost"), await _session_map(guild, user))
         await send_v2_message(ch, comps, allowed_mentions=_session_allowed_mentions())
         return f"Boost posted in {ch.mention}."
     if action == "end":
@@ -5883,7 +6076,7 @@ async def _session_do(interaction, action):
         if d.get("vote"):
             await _session_edit_vote(guild, disabled=True)
             d["vote"] = None
-        comps = _ui_render(_session_design("end"), _session_mapping(guild, user))
+        comps = _ui_render(_session_design("end"), await _session_map(guild, user))
         await send_v2_message(ch, comps, allowed_mentions=_session_allowed_mentions())
         await _session_save()
         return f"Session ended, announced in {ch.mention}."
@@ -9081,6 +9274,7 @@ async def apply_config(feature, cfg, post_panel=False):
               f"{len(_pf_inputs(design))} form field(s)")
     elif feature == "roleplay-sessions":
         session_config["manager_role_ids"] = [str(x) for x in (cfg.get("manager_role_ids") or []) if x]
+        session_config["staff_role_ids"] = [str(x) for x in (cfg.get("staff_role_ids") or []) if x]
         session_config["channel_id"] = str(cfg.get("channel_id") or "")
         session_config["ping_role_id"] = str(cfg.get("ping_role_id") or "")
         try:
@@ -9093,6 +9287,7 @@ async def apply_config(feature, cfg, post_panel=False):
             _register_eph_from_tree(session_config["designs"][k])
         print(f"[Config] roleplay-sessions, channel {session_config['channel_id'] or '(none)'} "
               f"ping {session_config['ping_role_id'] or '(none)'} votes {session_config['vote_needed']} "
+              f"staff roles {_session_staff_roles() or '(none)'} "
               f"designs {[k for k, v in session_config['designs'].items() if v]}")
     elif feature == "roleplay-shifts":
         shift_config["staff_role_ids"] = [str(x) for x in (cfg.get("staff_role_ids") or []) if x]
