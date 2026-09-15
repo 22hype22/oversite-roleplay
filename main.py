@@ -1423,6 +1423,9 @@ async def on_ready():
         ticket_staff_reply_tick.start()
     if not econ_autosave.is_running():
         econ_autosave.start()
+    # Read the owner's status before showing anything, so a redeploy never
+    # flashes the fallback line over what they set.
+    await load_status_config()
     await refresh_status()
 
     try:
@@ -2240,19 +2243,160 @@ async def send_welcome(channel, member):
         print(f"[Welcome] send failed: {e}")
 
 
-async def refresh_status():
-    total = sum((g.member_count or 0) for g in bot.guilds)
-    try:
-        await bot.change_presence(
-            status=discord.Status.online,
-            activity=discord.Activity(type=discord.ActivityType.watching, name=f"Watching over {total} roleplayers"),
+# ── Status ───────────────────────────────────────────────────────────────────
+# The status the owner types in the dashboard is the bot's status. It used to
+# be thrown away here: set_status re-applied a hardcoded member-count line
+# instead of reading the payload, and a ten-minute loop re-applied it, so a
+# status typed into the dashboard was gone within minutes. The count line is
+# now only what a bot says when its owner has set nothing.
+#
+# More than one line rotates. Discord rate-limits presence updates, so the
+# interval has a floor and nothing is sent when the line has not changed.
+
+_ACTIVITY_TYPES = {
+    "playing": discord.ActivityType.playing,
+    "watching": discord.ActivityType.watching,
+    "listening": discord.ActivityType.listening,
+    "competing": discord.ActivityType.competing,
+    "streaming": discord.ActivityType.streaming,
+}
+_PRESENCE_STATES = {
+    "online": discord.Status.online,
+    "idle": discord.Status.idle,
+    "dnd": discord.Status.dnd,
+    "invisible": discord.Status.invisible,
+}
+MIN_ROTATE_SECONDS = 15
+
+status_state = {
+    "presence": "online",
+    "activity_type": "playing",
+    "lines": [],        # [{"text": str, "activity_type": str}], in order
+    "seconds": 0,       # 0 = no rotation
+    "index": 0,
+    "last_switch": 0.0,
+    "applied": None,    # last (presence, type, text) actually sent to Discord
+    "fallback_at": 0.0,
+}
+
+
+def status_lines_from(activity_text, rotation, default_type):
+    """The dashboard's fields as the ordered list to cycle through. A single
+    status message is just a list of one."""
+    out = []
+    if isinstance(rotation, list):
+        for entry in rotation:
+            if isinstance(entry, dict):
+                text = str(entry.get("text") or "").strip()
+                atype = str(entry.get("activity_type") or default_type or "playing").lower()
+            else:
+                text, atype = str(entry or "").strip(), str(default_type or "playing").lower()
+            if text:
+                out.append({"text": text, "activity_type": atype})
+    if not out and activity_text and str(activity_text).strip():
+        out.append({"text": str(activity_text).strip(),
+                    "activity_type": str(default_type or "playing").lower()})
+    return out
+
+
+async def send_presence(presence, activity_type, text):
+    """Push one status to Discord, skipping the call when nothing changed."""
+    want = (presence, activity_type, text)
+    if status_state["applied"] == want:
+        return
+    state = _PRESENCE_STATES.get(str(presence or "online").lower(), discord.Status.online)
+    activity = None
+    if text:
+        activity = discord.Activity(
+            type=_ACTIVITY_TYPES.get(str(activity_type or "playing").lower(), discord.ActivityType.playing),
+            name=text,
         )
+    try:
+        await bot.change_presence(status=state, activity=activity)
+        status_state["applied"] = want
     except Exception as e:
         print(f"[Status] update failed: {e}")
 
 
-@tasks.loop(minutes=10)
+def set_status_config(presence=None, activity_type=None, activity_text=None,
+                      rotation=None, rotation_seconds=None):
+    """Take what the dashboard sent and work out what to show."""
+    if presence:
+        status_state["presence"] = str(presence).lower()
+    if activity_type:
+        status_state["activity_type"] = str(activity_type).lower()
+    lines = status_lines_from(activity_text, rotation, status_state["activity_type"])
+    if lines != status_state["lines"]:
+        status_state["lines"] = lines
+        status_state["index"] = 0
+        status_state["last_switch"] = 0.0
+    try:
+        seconds = int(rotation_seconds or 0)
+    except (TypeError, ValueError):
+        seconds = 0
+    status_state["seconds"] = max(MIN_ROTATE_SECONDS, seconds) if seconds else 0
+
+
+async def refresh_status():
+    """Show the current line. With nothing set, fall back to the member count
+    so a bot nobody has configured still says something."""
+    lines = status_state["lines"]
+    if not lines:
+        total = sum((g.member_count or 0) for g in bot.guilds)
+        text = (f"Watching over {total} roleplayers" if BOT_BASE == "roleplay"
+                else f"Overseeing {total} members")
+        status_state["fallback_at"] = time.time()
+        await send_presence(status_state["presence"], "watching", text)
+        return
+    line = lines[status_state["index"] % len(lines)]
+    await send_presence(status_state["presence"], line["activity_type"], line["text"])
+
+
+async def load_status_config():
+    """Read the owner's status straight off the order, so a redeploy comes back
+    showing what they set rather than the fallback."""
+    if not (SUPABASE_URL and BOT_ORDER_ID):
+        return
+    try:
+        async with _http() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/bot_orders?id=eq.{BOT_ORDER_ID}"
+                "&select=presence_status,activity_type,activity_text,status_rotation,status_rotation_seconds",
+                headers={"x-worker-token": WORKER_TOKEN, "apikey": SUPABASE_KEY,
+                         "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=10,
+            )
+            data = r.json()
+        if isinstance(data, list) and data:
+            row = data[0]
+            set_status_config(
+                presence=row.get("presence_status"),
+                activity_type=row.get("activity_type"),
+                activity_text=row.get("activity_text"),
+                rotation=row.get("status_rotation"),
+                rotation_seconds=row.get("status_rotation_seconds"),
+            )
+    except Exception as e:
+        print(f"[Status] config load failed: {e}")
+
+
+@tasks.loop(seconds=15)
 async def update_status():
+    """Drives rotation, and re-reads the owner's status so a dashboard change
+    lands even if the command that announced it never arrived."""
+    await load_status_config()
+    lines = status_state["lines"]
+    seconds = status_state["seconds"]
+    now = time.time()
+    if lines and len(lines) > 1 and seconds:
+        if now - status_state["last_switch"] >= seconds:
+            status_state["last_switch"] = now
+            status_state["index"] = (status_state["index"] + 1) % len(lines)
+            await refresh_status()
+        return
+    # No rotation: keep the single line applied, and refresh the member-count
+    # fallback occasionally so its number does not go stale.
+    if not lines and now - status_state["fallback_at"] < 600:
+        return
     await refresh_status()
 
 
@@ -10891,6 +11035,19 @@ async def poll_configs():
             await complete_command(command_id)
 
         elif action == "set_status":
+            # Use what the dashboard actually sent. This used to call
+            # refresh_status() with no arguments, which re-applied the
+            # hardcoded member count and threw the owner's status away.
+            cfg = payload if isinstance(payload, dict) else {}
+            set_status_config(
+                presence=cfg.get("presence_status"),
+                activity_type=cfg.get("activity_type"),
+                activity_text=cfg.get("activity_text") or cfg.get("status_text"),
+                rotation=cfg.get("rotation"),
+                rotation_seconds=cfg.get("rotation_seconds"),
+            )
+            status_state["index"] = 0
+            status_state["last_switch"] = time.time()
             await refresh_status()
             await complete_command(command_id)
 
