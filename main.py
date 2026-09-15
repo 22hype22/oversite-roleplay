@@ -1902,9 +1902,47 @@ async def resetinvites_cmd(interaction: discord.Interaction, user: discord.Membe
 bot.tree.add_command(leaderboard_group)
 
 
+async def _recall_verification(member):
+    """A member just joined. If this Discord account has verified through this
+    bot before, or through any other Oversite bot, apply it now without asking
+    them to log in. Silent when there is nothing to recall."""
+    if member.bot or not roblox_config.get("auto_verify_on_join", True):
+        return
+    if not roblox_config.get("reuse_verifications", True):
+        return
+    if not (roblox_config.get("verified_role_ids") or roblox_config.get("set_nickname", True)):
+        return  # nothing configured to apply
+    try:
+        session = await get_poll_session()
+        async with session.post(
+            f"{SUPABASE_FN_URL}/roblox-verify",
+            headers=_fn_headers(),
+            json={
+                "action": "recall",
+                "bot_id": BOT_ORDER_ID,
+                "guild_id": str(member.guild.id),
+                "discord_user_id": str(member.id),
+            },
+        ) as r:
+            data = await r.json() if r.status == 200 else {}
+        if isinstance(data, dict) and data.get("verified"):
+            await apply_roblox_verification({
+                "guild_id": str(member.guild.id),
+                "discord_user_id": str(member.id),
+                "roblox_username": data.get("roblox_username") or "",
+                "roblox_id": data.get("roblox_id") or "",
+            })
+            print(f"[Verify] recognised {member} on join as {data.get('roblox_username')!r}"
+                  f"{' from another server' if data.get('remembered') else ''}")
+    except Exception as e:
+        print(f"[Verify] recall on join failed: {e}")
+
+
 @bot.event
 async def on_member_join(member):
     await refresh_status()
+    # Off the join path so a slow lookup never delays the welcome message.
+    asyncio.create_task(_recall_verification(member))
     try:
         await _attribute_join(member)
     except Exception as e:
@@ -9184,6 +9222,10 @@ async def apply_config(feature, cfg, post_panel=False):
         roblox_config["log_channel_id"] = str(cfg.get("log_channel_id") or "")
         roblox_config["client_id"] = str(cfg.get("roblox_client_id") or "")
         roblox_config["client_secret"] = str(cfg.get("roblox_client_secret") or "")
+        # A member verified through any Oversite bot is recognised here without
+        # logging in again; on by default, and the join hook needs it too.
+        roblox_config["reuse_verifications"] = bool(cfg.get("reuse_verifications", True))
+        roblox_config["auto_verify_on_join"] = bool(cfg.get("auto_verify_on_join", True))
         comps = cfg.get("components")
         roblox_config["components"] = comps if isinstance(comps, list) else []
         roblox_config["button_label"] = str(cfg.get("verify_button_label") or "Verify")
@@ -10755,14 +10797,12 @@ async def apply_roblox_verification(payload):
 
 
 async def start_roblox_verify(interaction):
-    """A member clicked Verify — ask the edge function for their Roblox login URL."""
+    """A member clicked Verify. The edge function decides what happens: a member
+    already verified through any Oversite bot is applied here on the spot, and
+    everyone else gets a Roblox login — through this bot's own OAuth app if the
+    dashboard has one, otherwise through Oversite's. So an owner who cannot get
+    a Roblox app still gets verification."""
     await interaction.response.defer(ephemeral=True)
-    if not roblox_config.get("client_id"):
-        await interaction.followup.send(
-            embed=error_embed("Verification not set up", "An admin still needs to add the Roblox Client ID/Secret in the dashboard."),
-            ephemeral=True,
-        )
-        return
     try:
         session = await get_poll_session()
         async with session.post(
@@ -10775,13 +10815,43 @@ async def start_roblox_verify(interaction):
                 "discord_user_id": str(interaction.user.id),
             },
         ) as r:
-            data = await r.json() if r.status == 200 else {}
-        url = data.get("url") if isinstance(data, dict) else None
-        if not url:
+            status = r.status
+            try:
+                data = await r.json()
+            except Exception:
+                data = {}
+        if not isinstance(data, dict):
+            data = {}
+        if data.get("verified"):
+            # Known from another server: nickname and roles go on right now.
+            await apply_roblox_verification({
+                "guild_id": str(interaction.guild_id),
+                "discord_user_id": str(interaction.user.id),
+                "roblox_username": data.get("roblox_username") or "",
+                "roblox_id": data.get("roblox_id") or "",
+            })
+            name = data.get("roblox_username") or "your Roblox account"
             await interaction.followup.send(
-                embed=error_embed("Couldn't start verification", "Please try again in a moment."),
+                embed=success_embed("You're verified",
+                                    f"You already verified as **{name}** with Oversite, so it's been applied here. "
+                                    "No need to log in again."),
                 ephemeral=True,
             )
+            return
+        url = data.get("url")
+        if not url:
+            why = str(data.get("error") or "")
+            if "not set up" in why.lower():
+                await interaction.followup.send(
+                    embed=error_embed("Verification not set up", "An admin still needs to finish the Verification setup in the dashboard."),
+                    ephemeral=True,
+                )
+            else:
+                print(f"[Verify] start returned HTTP {status}: {why or data}")
+                await interaction.followup.send(
+                    embed=error_embed("Couldn't start verification", "Please try again in a moment."),
+                    ephemeral=True,
+                )
             return
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label="Link Roblox", url=url, style=discord.ButtonStyle.link, emoji="🔗"))
