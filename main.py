@@ -6083,6 +6083,41 @@ async def _ticket_last_activity(ch):
         return None
 
 
+# Two Oversite bots can share a server — Customs and Roleplay run the same
+# ticket engine — and a ticket channel announces itself only through its
+# "ticket|..." topic. Nothing in the topic says which bot opened it, so without
+# an ownership test both bots warn, escalate and auto-close the same tickets:
+# a Customs order gets reminders from the Roleplay bot, in the wrong design,
+# twice over. A ticket belongs to whichever bot posted its opening panel, which
+# is always the oldest message in the channel. That never changes, so the answer
+# is cached per channel.
+_ticket_owner_mine = {}
+
+
+async def _ticket_is_mine(ch):
+    """True when this bot opened the ticket, False when another bot did.
+    None when history can't be read yet — callers skip that tick rather than
+    guessing, so a permissions blip never hands someone else's ticket to us."""
+    wid = str(ch.id)
+    cached = _ticket_owner_mine.get(wid)
+    if cached is not None:
+        return cached
+    me_id = getattr(bot.user, "id", None)
+    if me_id is None:
+        return None
+    try:
+        first = None
+        async for msg in ch.history(limit=1, oldest_first=True):
+            first = msg
+        if first is None:
+            return None  # nothing posted yet: decide once there is a message
+        mine = getattr(first.author, "id", None) == me_id
+        _ticket_owner_mine[wid] = mine
+        return mine
+    except Exception:
+        return None
+
+
 async def _ticket_warn_msg(ch, opener):
     design = _small_ui("ticket_inactivity_warn")
     if design:
@@ -6120,6 +6155,8 @@ async def ticket_inactivity_tick():
             topic = getattr(ch, "topic", "") or ""
             if not topic.startswith("ticket|"):
                 continue
+            if await _ticket_is_mine(ch) is not True:
+                continue  # another bot's ticket (or unreadable) — not ours to police
             wid = str(ch.id)
             live_ids.add(wid)
             if wid in _ticket_ac_hold:
@@ -6243,6 +6280,8 @@ async def ticket_staff_reply_tick():
             info = _ticket_topic_info(ch)
             if not info:
                 continue
+            if await _ticket_is_mine(ch) is not True:
+                continue  # another bot's ticket (or unreadable) — not ours to chase
             wid = str(ch.id)
             live.add(wid)
             if not info["claimed"] or wid in _ticket_ac_hold:
@@ -6268,7 +6307,12 @@ async def ticket_staff_reply_tick():
                     dirty = True
                 continue
             claimer = guild.get_member(int(info["claimer_id"])) if info["claimer_id"] else None
-            roles = _ticket_reping_roles(ch) if want >= 2 else []
+            # Escalation chases the person who took the order, not the building.
+            # _ticket_reping_roles returns every role that can see the channel,
+            # which on a busy order is the whole staff team — seven roles pinged
+            # about a ticket that already has one owner. Only fall back to those
+            # roles when nobody is holding it.
+            roles = _ticket_reping_roles(ch) if (want >= 2 and claimer is None) else []
             if want == 1 and claimer is None:
                 continue  # old-format claim with no claimer id: only the 24h staff ping applies
             try:
