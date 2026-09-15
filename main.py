@@ -15175,6 +15175,83 @@ async def say_command(
         ephemeral=True)
 
 
+# ------------------------------------------------------------------- /dmsay
+#
+# Send someone a direct message as the bot. Staff use it for the things that
+# should not be said in public: a warning, a decision on a ticket, a quiet word.
+#
+# A bot DM that does not say where it came from is an anonymous message from a
+# stranger, and that is the shape every bit of DM harassment takes. So the
+# server's name is on it, always, and it cannot be turned off. The recipient can
+# see who to take it up with, and whoever sends it knows that.
+@bot.tree.command(name="dmsay", description="Send someone a direct message as the bot")
+@app_commands.describe(
+    member="Who to message. They have to be in this server.",
+    message="What to say. Use \\n for a new line.",
+    title="Optional title for the embed.",
+    color="Optional hex colour, such as 5865F2.",
+    image="Optional image URL.",
+)
+async def dmsay_command(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    message: str,
+    title: str = None,
+    color: str = None,
+    image: str = None,
+):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            embed=error_embed("No permission", "Only staff can message people as the bot."),
+            ephemeral=True)
+        return
+    if member.bot:
+        await interaction.response.send_message(
+            embed=error_embed("That is a bot", "Bots cannot be messaged this way."),
+            ephemeral=True)
+        return
+
+    body = message.replace("\\n", "\n")
+    try:
+        tint = int(str(color).replace("#", ""), 16) if color else ACCENT
+    except Exception:
+        tint = ACCENT
+    embed = discord.Embed(description=body or None, color=tint)
+    if title:
+        embed.title = title
+    if image:
+        embed.set_image(url=image)
+    # Not decoration, and not optional: this is what stops the message being
+    # anonymous. Sent by staff, from a named server, so it can be replied to in
+    # the right place.
+    embed.set_author(
+        name=f"From {interaction.guild.name}",
+        icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
+    embed.set_footer(text="Sent by a staff member. Reply in the server, not here.")
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await member.send(embed=embed)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            embed=error_embed(
+                "Their DMs are closed",
+                f"{member.mention} does not take direct messages from this server, "
+                f"so nothing was sent. Say it in a channel or a ticket instead."),
+            ephemeral=True)
+        return
+    except Exception as exc:
+        await interaction.followup.send(
+            embed=error_embed("That did not send", str(exc)[:300]), ephemeral=True)
+        return
+
+    # Who said what to whom, on the record, because a message sent as the bot
+    # has no author on it and this is the only place that answer exists.
+    print(f"[DMSay] {interaction.user} messaged {member} as the bot", flush=True)
+    await interaction.followup.send(
+        embed=success_embed("Sent", f"{member.mention} has it."), ephemeral=True)
+
+
 def _run():
     # uvloop: drop-in libuv event loop, measurably faster for IO-heavy bots.
     # Guarded — if it's ever missing or broken we run on stock asyncio.
