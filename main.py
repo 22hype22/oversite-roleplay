@@ -15032,7 +15032,7 @@ def info_version():
     return sha[:7]
 
 
-def info_embed(me=None):
+def info_card_embed(me=None):
     embed = discord.Embed(title=INFO_NAME, description=INFO_WHAT, color=INFO_COLOR)
     # Concatenated rather than an f-string: the newline would be a backslash
     # inside one, which the Python one of these bots runs on rejects.
@@ -15057,9 +15057,122 @@ def info_embed(me=None):
 async def info_command(interaction):
     try:
         await interaction.response.send_message(
-            embed=info_embed(getattr(interaction.client, "user", None)))
+            embed=info_card_embed(getattr(interaction.client, "user", None)))
     except Exception as exc:
         print(f"/info failed: {exc}", flush=True)
+
+
+# ---------------------------------------------------------------------- /say
+#
+# Post a message as the bot. Staff write announcements, rules and notices that
+# should carry the server's voice rather than a person's, and the alternative is
+# copying text into a webhook or asking somebody with the token.
+#
+# Plain text by default, because most of what gets said this way is a sentence.
+# A title or a colour turns it into an embed, so the one command covers both
+# without a second one to remember.
+@bot.tree.command(name="say", description="Post a message as the bot")
+@app_commands.describe(
+    message="What to say. Use \\n for a new line.",
+    channel="Where to post it. Defaults to this channel.",
+    title="Optional title. Giving one makes it an embed.",
+    color="Optional hex colour for the embed, such as 5865F2.",
+    image="Optional image URL for the embed.",
+    reply_to="Optional message ID to reply to.",
+)
+async def say_command(
+    interaction: discord.Interaction,
+    message: str,
+    channel: discord.TextChannel = None,
+    title: str = None,
+    color: str = None,
+    image: str = None,
+    reply_to: str = None,
+):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            embed=error_embed("No permission", "Only staff can post as the bot."),
+            ephemeral=True)
+        return
+    target = channel or interaction.channel
+    if not isinstance(target, (discord.TextChannel, discord.Thread)):
+        await interaction.response.send_message(
+            embed=error_embed("Pick a channel", "That is not somewhere I can post."),
+            ephemeral=True)
+        return
+
+    # Named rather than assumed: a missing permission here reads as the bot
+    # ignoring the command, and "I cannot post there" is the whole answer.
+    me = target.guild.me
+    perms = target.permissions_for(me)
+    if not perms.send_messages:
+        await interaction.response.send_message(
+            embed=error_embed("I cannot post there",
+                              f"Give me Send Messages in {target.mention}."),
+            ephemeral=True)
+        return
+    if (title or color or image) and not perms.embed_links:
+        await interaction.response.send_message(
+            embed=error_embed("I cannot embed there",
+                              f"Give me Embed Links in {target.mention}, or drop the "
+                              f"title and colour to post it as plain text."),
+            ephemeral=True)
+        return
+
+    body = message.replace("\\n", "\n")
+
+    # Replying to something is how a notice lands under the thing it is about.
+    reference = None
+    if reply_to:
+        try:
+            reference = await target.fetch_message(int(reply_to.strip()))
+        except Exception:
+            await interaction.response.send_message(
+                embed=error_embed("No such message",
+                                  "I could not find that message in that channel. "
+                                  "Copy the message ID with Developer Mode on."),
+                ephemeral=True)
+            return
+
+    kwargs = {}
+    if title or color or image:
+        try:
+            tint = int(str(color).replace("#", ""), 16) if color else ACCENT
+        except Exception:
+            tint = ACCENT
+        embed = discord.Embed(description=body or None, color=tint)
+        if title:
+            embed.title = title
+        if image:
+            embed.set_image(url=image)
+        kwargs["embed"] = embed
+    else:
+        kwargs["content"] = body
+    if reference is not None:
+        kwargs["reference"] = reference
+        kwargs["mention_author"] = False
+
+    # Nothing here should let one person make the bot ping everyone.
+    kwargs["allowed_mentions"] = discord.AllowedMentions(
+        everyone=False, roles=False, users=True, replied_user=False)
+
+    try:
+        sent = await target.send(**kwargs)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            embed=error_embed("I cannot post there",
+                              f"Discord refused it. Check my permissions on {target.mention}."),
+            ephemeral=True)
+        return
+    except Exception as exc:
+        await interaction.response.send_message(
+            embed=error_embed("That did not send", str(exc)[:300]), ephemeral=True)
+        return
+
+    print(f"[Say] {interaction.user} posted as the bot in #{target}", flush=True)
+    await interaction.response.send_message(
+        embed=success_embed("Sent", f"[Posted in {target.mention}]({sent.jump_url})"),
+        ephemeral=True)
 
 
 def _run():
