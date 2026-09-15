@@ -1910,8 +1910,8 @@ async def _recall_verification(member):
         return
     if not roblox_config.get("reuse_verifications", True):
         return
-    if not (roblox_config.get("verified_role_ids") or roblox_config.get("set_nickname", True)):
-        return  # nothing configured to apply
+    if not roblox_config.get("configured"):
+        return  # verification was never set up here; the owner has not opted in
     try:
         session = await get_poll_session()
         async with session.post(
@@ -9226,6 +9226,10 @@ async def apply_config(feature, cfg, post_panel=False):
         # logging in again; on by default, and the join hook needs it too.
         roblox_config["reuse_verifications"] = bool(cfg.get("reuse_verifications", True))
         roblox_config["auto_verify_on_join"] = bool(cfg.get("auto_verify_on_join", True))
+        # Only a server that has saved the Verification block has opted in to
+        # any of this. The join hook checks this rather than the defaults, so a
+        # server that never set verification up never has a nickname changed.
+        roblox_config["configured"] = True
         comps = cfg.get("components")
         roblox_config["components"] = comps if isinstance(comps, list) else []
         roblox_config["button_label"] = str(cfg.get("verify_button_label") or "Verify")
